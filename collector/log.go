@@ -88,11 +88,30 @@ func (c *LogCollectOptions) SetDir(dir string) {
 	c.resultDir = dir
 }
 
+// logTypesToScrap returns the types of logs to be scrapped from the component
+// log directories. RocksDB logs are not part of it: they live in the TiKV data
+// directory and are collected by a dedicated step, so the generic scraper step
+// must not be built at all when this returns an empty list (scraper rejects a
+// flag without value: "flag needs an argument: --logtype").
+func (c *LogCollectOptions) logTypesToScrap() []string {
+	var logTypes []string
+	if c.collector.Std {
+		logTypes = append(logTypes, scraper.LogTypeStd)
+	}
+	if c.collector.Slow {
+		logTypes = append(logTypes, scraper.LogTypeSlow)
+	}
+	if c.collector.Unknown {
+		logTypes = append(logTypes, scraper.LogTypeUnknown)
+	}
+	return logTypes
+}
+
 // Prepare implements the Collector interface
 func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[string][]CollectStat, error) {
 	switch m.mode {
 	case CollectModeTiUP:
-		if !(c.collector.Std || c.collector.Slow || c.collector.Rocksdb) {
+		if !(c.collector.Std || c.collector.Slow || c.collector.Unknown || c.collector.Rocksdb) {
 			return nil, nil
 		}
 	case CollectModeK8s:
@@ -189,9 +208,9 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 							if err != nil {
 								return err
 							}
-							for host, files := range stats {
-								c.fileStats[host] = files
-							}
+							// several TiKV instances may live on the same host,
+							// each of them contributes its own rocksdb logs
+							mergeFileStats(c.fileStats, stats)
 							return nil
 						},
 					)
@@ -205,49 +224,41 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 		}
 	}
 
-	var scraperLogType []string
-	if c.collector.Std {
-		scraperLogType = append(scraperLogType, scraper.LogTypeStd)
-	}
-	if c.collector.Slow {
-		scraperLogType = append(scraperLogType, scraper.LogTypeSlow)
-	}
-	if c.collector.Unknown {
-		scraperLogType = append(scraperLogType, scraper.LogTypeUnknown)
-	}
+	scraperLogType := c.logTypesToScrap()
 
 	// build scraper tasks
 	for h, t := range hostTasks {
 		host := h
-		t = t.
-			Shell(
-				host,
-				fmt.Sprintf("%s --log '%s' -f '%s' -t '%s' --logtype %s",
-					filepath.Join(task.CheckToolsPathDir, "bin", "scraper"),
-					strings.Join(hostPaths[host].Slice(), ","),
-					c.ScrapeBegin, c.ScrapeEnd,
-					strings.Join(scraperLogType, ","),
-				),
-				"",
-				false,
-			).
-			Func(
-				host,
-				func(ctx context.Context) error {
-					stats, err := parseScraperSamples(ctx, host)
-					if err != nil {
-						return err
-					}
-					for host, files := range stats {
-						if c.fileStats[host] == nil {
-							c.fileStats[host] = files
-						} else {
-							c.fileStats[host] = append(c.fileStats[host], files...)
+		// Only build the generic scraper step when at least one log type of the
+		// component log directories (std/slow/unknown) is requested. Otherwise
+		// the scraper would be invoked with an empty --logtype value, which
+		// makes it fail with "flag needs an argument: --logtype" and aborts the
+		// whole collection (e.g. `--include=log.rocksdb`).
+		if len(scraperLogType) > 0 {
+			t = t.
+				Shell(
+					host,
+					fmt.Sprintf("%s --log '%s' -f '%s' -t '%s' --logtype %s",
+						filepath.Join(task.CheckToolsPathDir, "bin", "scraper"),
+						strings.Join(hostPaths[host].Slice(), ","),
+						c.ScrapeBegin, c.ScrapeEnd,
+						strings.Join(scraperLogType, ","),
+					),
+					"",
+					false,
+				).
+				Func(
+					host,
+					func(ctx context.Context) error {
+						stats, err := parseScraperSamples(ctx, host)
+						if err != nil {
+							return err
 						}
-					}
-					return nil
-				},
-			)
+						mergeFileStats(c.fileStats, stats)
+						return nil
+					},
+				)
+		}
 		t1 := t.BuildAsStep(fmt.Sprintf("  - Scraping log files on %s:%d", host, uniqueHosts[host]))
 		dryRunTasks = append(dryRunTasks, t1)
 	}
@@ -448,6 +459,20 @@ func (c *LogCollectOptions) collectK8s(m *Manager, cls *models.TiDBCluster) erro
 	}
 
 	return nil
+}
+
+// mergeFileStats merges the result of one scraper run into fileStats. A host
+// may run the scraper several times (once per TiKV instance for rocksdb logs,
+// and once for the component log directories), so results must be accumulated
+// instead of overwritten, otherwise only the last run would be collected.
+func mergeFileStats(fileStats map[string][]CollectStat, stats map[string][]CollectStat) {
+	for host, files := range stats {
+		if fileStats[host] == nil {
+			fileStats[host] = files
+		} else {
+			fileStats[host] = append(fileStats[host], files...)
+		}
+	}
 }
 
 func parseScraperSamples(ctx context.Context, host string) (map[string][]CollectStat, error) {
