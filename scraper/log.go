@@ -15,6 +15,7 @@ package scraper
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"hash/fnv"
@@ -213,6 +214,14 @@ var (
 // multi-line record: TiKV stamps the first physical line of a record only.
 type lineTime func(line []byte) (time.Time, bool)
 
+// lineBody strips the line ending. Extractors are fed lines as they come from
+// the file, and the parsers of collector/log/parser anchor some patterns with
+// "$", which only matches at the very end of the input: a slow query header
+// would not be recognised while it still carries its "\n".
+func lineBody(line []byte) []byte {
+	return bytes.TrimRight(line, "\r\n")
+}
+
 func rocksDBLineTime(line []byte) (time.Time, bool) {
 	if m := rocksDBTimeRE.FindSubmatch(line); m != nil {
 		if t, err := time.Parse(parser.TimeStampLayout, string(m[1])); err == nil {
@@ -280,7 +289,7 @@ func fileHeadInRange(fpath string, fi fs.FileInfo, extract lineTime, start, end 
 	for i := 0; i < maxLeadingLines; i++ {
 		line, err := r.ReadBytes('\n')
 		if len(line) > 0 {
-			if t, ok := extract(line); ok {
+			if t, ok := extract(lineBody(line)); ok {
 				return !t.After(end)
 			}
 		}
@@ -321,7 +330,7 @@ func trimToRange(src, dst string, extract lineTime, start, end time.Time) (writt
 	for {
 		line, rerr := r.ReadBytes('\n')
 		if len(line) > 0 {
-			if t, ok := extract(line); ok {
+			if t, ok := extract(lineBody(line)); ok {
 				found = true
 				keep = !t.Before(start) && !t.After(end)
 			}

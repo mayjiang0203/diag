@@ -190,6 +190,20 @@ func rocksdbScraperCmd(dataDir, begin, end, outDir string) string {
 		scraperPath(), dataDir, begin, end, scraper.LogTypeRocksDB, outDir)
 }
 
+// collectScrapedStats reads the sample the scraper printed for host and merges
+// it into fileStats. Every scraper step ends here, so a host that runs the
+// scraper several times - once per TiKV instance for the rocksdb logs, plus
+// once for the component log directories - accumulates all the results instead
+// of keeping only the last one.
+func (c *LogCollectOptions) collectScrapedStats(ctx context.Context, host string) error {
+	stats, err := parseScraperSamples(ctx, host)
+	if err != nil {
+		return err
+	}
+	mergeFileStats(c.fileStats, stats)
+	return nil
+}
+
 // Prepare implements the Collector interface
 func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[string][]CollectStat, error) {
 	switch m.mode {
@@ -203,7 +217,44 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 		return nil, nil
 	}
 
-	topo := cls.Attributes[CollectModeTiUP].(spec.Topology)
+	tasks, err := c.buildTiUPLogTasks(m, cls.Attributes[CollectModeTiUP].(spec.Topology))
+	if err != nil {
+		return nil, err
+	}
+
+	t := task.NewBuilder(m.logger).
+		ParallelStep("+ Download necessary tools", false, tasks.download...).
+		ParallelStep("+ Collect host information", false, tasks.scrape...).
+		Build()
+
+	ctx := ctxt.New(
+		context.Background(),
+		c.opt.Concurrency,
+		m.logger,
+	)
+	if err := t.Execute(ctx); err != nil {
+		if errorx.Cast(err) != nil {
+			// FIXME: Map possible task errors and give suggestions.
+			return nil, err
+		}
+		return nil, perrs.Trace(err)
+	}
+
+	return c.fileStats, nil
+}
+
+// tiUPLogTasks are the steps of one log collection on a tiup deployed cluster:
+// the ones that put the collecting tools on the hosts, and the ones that scrape
+// the logs. They are built apart from Prepare so that the wiring - which
+// commands are generated for which host, and what is cleaned up afterwards -
+// can be checked without a cluster.
+type tiUPLogTasks struct {
+	download []*task.StepDisplay
+	scrape   []*task.StepDisplay
+}
+
+// buildTiUPLogTasks builds the steps of a tiup collection without running them.
+func (c *LogCollectOptions) buildTiUPLogTasks(m *Manager, topo spec.Topology) (*tiUPLogTasks, error) {
 	var (
 		dryRunTasks   []*task.StepDisplay
 		downloadTasks []*task.StepDisplay
@@ -277,24 +328,18 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 				// rotation and TiKV never deletes the rotated ones
 				// (log.file.max-backups defaults to 0), so collecting them in
 				// full is both slow and useless.
-				hostTasks[inst.GetHost()].
+				host := inst.GetHost()
+				hostTasks[host].
 					Shell(
-						inst.GetHost(),
+						host,
 						rocksdbScraperCmd(inst.DataDir(), c.ScrapeBegin, c.ScrapeEnd, trimDir()),
 						"",
 						false,
 					).
 					Func(
-						inst.GetHost(),
+						host,
 						func(ctx context.Context) error {
-							stats, err := parseScraperSamples(ctx, inst.GetHost())
-							if err != nil {
-								return err
-							}
-							// several TiKV instances may live on the same host,
-							// each of them contributes its own rocksdb logs
-							mergeFileStats(c.fileStats, stats)
-							return nil
+							return c.collectScrapedStats(ctx, host)
 						},
 					)
 			}
@@ -328,12 +373,7 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 				Func(
 					host,
 					func(ctx context.Context) error {
-						stats, err := parseScraperSamples(ctx, host)
-						if err != nil {
-							return err
-						}
-						mergeFileStats(c.fileStats, stats)
-						return nil
+						return c.collectScrapedStats(ctx, host)
 					},
 				)
 		}
@@ -341,25 +381,7 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 		dryRunTasks = append(dryRunTasks, t1)
 	}
 
-	t := task.NewBuilder(m.logger).
-		ParallelStep("+ Download necessary tools", false, downloadTasks...).
-		ParallelStep("+ Collect host information", false, dryRunTasks...).
-		Build()
-
-	ctx := ctxt.New(
-		context.Background(),
-		c.opt.Concurrency,
-		m.logger,
-	)
-	if err := t.Execute(ctx); err != nil {
-		if errorx.Cast(err) != nil {
-			// FIXME: Map possible task errors and give suggestions.
-			return nil, err
-		}
-		return nil, perrs.Trace(err)
-	}
-
-	return c.fileStats, nil
+	return &tiUPLogTasks{download: downloadTasks, scrape: dryRunTasks}, nil
 }
 
 // Collect implements the Collector interface
@@ -373,10 +395,36 @@ func (c *LogCollectOptions) Collect(m *Manager, cls *models.TiDBCluster) error {
 	}
 
 	topo := cls.Attributes[CollectModeTiUP].(spec.Topology)
-	var (
-		collectTasks []*task.StepDisplay
-		cleanTasks   []*task.StepDisplay
+	collectTasks, cleanTasks, err := c.buildTiUPLogDownloadTasks(m, topo)
+	if err != nil {
+		return err
+	}
+
+	t := task.NewBuilder(m.logger).
+		ParallelStep("+ Scrap files on nodes", false, collectTasks...).
+		ParallelStep("+ Cleanup temp files", false, cleanTasks...).
+		Build()
+
+	ctx := ctxt.New(
+		context.Background(),
+		c.opt.Concurrency,
+		m.logger,
 	)
+	if err := t.Execute(ctx); err != nil {
+		if errorx.Cast(err) != nil {
+			// FIXME: Map possible task errors and give suggestions.
+			return err
+		}
+		return perrs.Trace(err)
+	}
+
+	return nil
+}
+
+// buildTiUPLogDownloadTasks builds the steps that download the files found on
+// the hosts and the ones that remove the temporary directories afterwards,
+// without running them.
+func (c *LogCollectOptions) buildTiUPLogDownloadTasks(m *Manager, topo spec.Topology) (collectTasks, cleanTasks []*task.StepDisplay, err error) {
 	uniqueHosts := map[string]int{} // host -> ssh-port
 
 	roleFilter := set.NewStringSet(c.opt.Roles...)
@@ -406,7 +454,7 @@ func (c *LogCollectOptions) Collect(m *Manager, cls *models.TiDBCluster) error {
 
 			t2, err := m.sshTaskBuilder(c.GetBaseOptions().Cluster, topo, c.GetBaseOptions().User, *c.opt)
 			if err != nil {
-				return err
+				return nil, nil, err
 			}
 			for _, f := range c.fileStats[inst.GetHost()] {
 				// build checking tasks
@@ -428,7 +476,7 @@ func (c *LogCollectOptions) Collect(m *Manager, cls *models.TiDBCluster) error {
 
 			b, err := m.sshTaskBuilder(c.GetBaseOptions().Cluster, topo, c.GetBaseOptions().User, *c.opt)
 			if err != nil {
-				return err
+				return nil, nil, err
 			}
 			// remove both the collecting tools and the trimmed copies this
 			// collector wrote during Prepare
@@ -439,25 +487,7 @@ func (c *LogCollectOptions) Collect(m *Manager, cls *models.TiDBCluster) error {
 		}
 	}
 
-	t := task.NewBuilder(m.logger).
-		ParallelStep("+ Scrap files on nodes", false, collectTasks...).
-		ParallelStep("+ Cleanup temp files", false, cleanTasks...).
-		Build()
-
-	ctx := ctxt.New(
-		context.Background(),
-		c.opt.Concurrency,
-		m.logger,
-	)
-	if err := t.Execute(ctx); err != nil {
-		if errorx.Cast(err) != nil {
-			// FIXME: Map possible task errors and give suggestions.
-			return err
-		}
-		return perrs.Trace(err)
-	}
-
-	return nil
+	return collectTasks, cleanTasks, nil
 }
 
 func (c *LogCollectOptions) prepareK8s(m *Manager, cls *models.TiDBCluster) (map[string][]CollectStat, error) {
