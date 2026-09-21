@@ -1,14 +1,56 @@
 package collector
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/pingcap/diag/scraper"
+	"github.com/pingcap/tiup/pkg/cluster/ctxt"
 	"github.com/pingcap/tiup/pkg/cluster/task"
+	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
 	"github.com/stretchr/testify/require"
 )
+
+// TestCollectScrapedStats covers the step between the scraper and the download:
+// the sample the scraper printed has to reach fileStats. Everything the scraper
+// reports now goes through this one method, so a merge that is missing, that
+// parses nothing, or that overwrites the previous scrape of the same host is
+// caught here instead of silently shipping the wrong file list.
+func TestCollectScrapedStats(t *testing.T) {
+	assert := require.New(t)
+	const host = "127.0.0.1"
+
+	ctx := ctxt.New(context.Background(), 1, logprinter.NewLogger(""))
+	scrape := func(stdout string) {
+		ctxt.GetInner(ctx).SetOutputs(host, []byte(stdout), nil)
+	}
+	opt := &LogCollectOptions{fileStats: map[string][]CollectStat{}}
+
+	scrape(`{"log_files":{"/data/db/data/tikv-20160/rocksdb.info":123},` +
+		`"config_files":{"/data/db/deploy/tikv-20160/conf/tikv.toml":7},` +
+		`"prometheus_data":{"/data/db/data/prom/tmp/blocks":9}}`)
+	assert.NoError(opt.collectScrapedStats(ctx, host))
+	assert.Equal([]CollectStat{
+		{Target: "/data/db/deploy/tikv-20160/conf/tikv.toml", Size: 7},
+		{Target: "/data/db/data/tikv-20160/rocksdb.info", Size: 123},
+		{Target: "/data/db/data/prom/tmp/blocks", Size: 9},
+	}, opt.fileStats[host])
+
+	// a second scrape of the same host (another TiKV instance) accumulates
+	scrape(`{"log_files":{"/data/db/data/tikv-20161/rocksdb.info":456}}`)
+	assert.NoError(opt.collectScrapedStats(ctx, host))
+	assert.Len(opt.fileStats[host], 4, "the previous scrape must not be overwritten")
+
+	// nothing printed means nothing to merge, and must not fail
+	scrape("")
+	assert.NoError(opt.collectScrapedStats(ctx, host))
+
+	// anything else the scraper could print is an error, not a silent skip
+	scrape("not json")
+	assert.Error(opt.collectScrapedStats(ctx, host))
+}
 
 // ---------------------------------------------------------------------------
 // the lifetime of what the collector writes on the target hosts

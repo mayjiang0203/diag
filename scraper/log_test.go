@@ -396,6 +396,152 @@ func TestRocksDBTrimsEveryLogFormat(t *testing.T) {
 	}
 }
 
+// TestRocksDBLineTimeRejections covers the shapes the extractor has to refuse:
+// a line it can not read a time from must not be mistaken for a record, and a
+// file full of them is collected in full rather than emptied.
+func TestRocksDBLineTimeRejections(t *testing.T) {
+	assert := require.New(t)
+
+	rejected := []string{
+		`{"level":"INFO","caller":"x:1","message":"no time field"}`,
+		`{"time":"not a timestamp","level":"INFO","message":"x"}`,
+		`{"time":"2024/01/01 10:00:00.000 +08:00","message":"no level"}`,
+		`{"time":123,"level":"INFO"}`,
+		`{"time":"2024/01/01 10:00:00.000 +08:00"`,
+		`[2024/13/45 99:99:99.999 +08:00][5][INFO] impossible time`,
+		`  continuation line`,
+	}
+	for _, line := range rejected {
+		_, ok := rocksDBLineTime([]byte(line))
+		assert.False(ok, "must not yield a timestamp: %s", line)
+	}
+
+	// TiKV can also be configured without timestamps: valid JSON without a time
+	// field means the file has to be collected whole
+	dir := t.TempDir()
+	src := writeFile(t, dir, "rocksdb.info",
+		`{"level":"INFO","caller":"x:1","message":"no time"}`+"\n")
+	dst := filepath.Join(dir, "out", "rocksdb.info")
+	_, found, err := trimToRange(src, dst, rocksDBLineTime,
+		mustTime(t, "2024/01/01 10:00:00.000 +08:00"), mustTime(t, "2024/01/01 11:00:00.000 +08:00"))
+	assert.NoError(err)
+	assert.False(found, "a file without timestamps must be reported as not trimmable")
+}
+
+// TestFileHeadInRangeHeadScanLimit pins the look ahead: TiKV stamps every line,
+// so the first one normally decides, but a file whose first timestamp sits
+// deeper than the scan window has to be kept rather than silently dropped.
+func TestFileHeadInRangeHeadScanLimit(t *testing.T) {
+	assert := require.New(t)
+	dir := t.TempDir()
+	start := mustTime(t, "2024/01/01 10:00:00.000 +08:00")
+	end := mustTime(t, "2024/01/01 11:00:00.000 +08:00")
+
+	build := func(leading int) string {
+		var b strings.Builder
+		for i := 0; i < leading; i++ {
+			b.WriteString("  continuation without a timestamp\n")
+		}
+		b.WriteString("[2024/01/01 12:00:00.000 +08:00][5][INFO] after the range\n")
+		return b.String()
+	}
+
+	near := writeFile(t, dir, "near.info", build(maxLeadingLines-1))
+	assert.False(fileHeadInRange(near, mustStat(t, near), rocksDBLineTime, start, end),
+		"a timestamp inside the scan window decides")
+
+	far := writeFile(t, dir, "far.info", build(maxLeadingLines+1))
+	assert.True(fileHeadInRange(far, mustStat(t, far), rocksDBLineTime, start, end),
+		"a file whose timestamps are all beyond the scan window is kept, never dropped")
+}
+
+func TestTrimToRangeSourceOpenFailure(t *testing.T) {
+	assert := require.New(t)
+	dir := t.TempDir()
+	_, _, err := trimToRange(filepath.Join(dir, "missing.info"), filepath.Join(dir, "out"),
+		rocksDBLineTime,
+		mustTime(t, "2024/01/01 10:00:00.000 +08:00"), mustTime(t, "2024/01/01 11:00:00.000 +08:00"))
+	assert.Error(err, "an unreadable source has to surface as an error, not as an empty copy")
+}
+
+// TestTrimFallsBackWhenTheDestinationCannotBeCreated exercises the failure after
+// the directory is in place: the copy can not be created at all, so the original
+// file must be reported and no partial copy left behind.
+func TestTrimFallsBackWhenTheDestinationCannotBeCreated(t *testing.T) {
+	assert := require.New(t)
+	dir, trimDir := t.TempDir(), t.TempDir()
+	src := writeFile(t, dir, "rocksdb.info", rocksdbFixture)
+
+	// a directory exactly where the trimmed copy would be written
+	dst := trimmedPath(trimDir, src)
+	assert.NoError(os.MkdirAll(dst, 0o755))
+
+	s := &LogScraper{
+		Paths:   []string{src},
+		Types:   map[string]bool{LogTypeRocksDB: true},
+		Start:   mustTime(t, "2024/01/01 10:15:00.000 +08:00"),
+		End:     mustTime(t, "2024/01/01 11:00:00.000 +08:00"),
+		Trim:    true,
+		TrimDir: trimDir,
+	}
+	sample := &Sample{}
+	assert.NoError(s.Scrap(sample))
+	assert.Equal(int64(len(rocksdbFixture)), sample.Log[src])
+	_, err := os.Stat(filepath.Join(dst, "rocksdb.info"))
+	assert.True(os.IsNotExist(err), "no partial copy may be reported")
+}
+
+// TestTrimStdAndSlowRecords walks the other two log types through the trimming.
+// Both carry their time in a different shape and both have multi line records,
+// which have to follow the record they belong to.
+func TestTrimStdAndSlowRecords(t *testing.T) {
+	assert := require.New(t)
+	dir := t.TempDir()
+	start := mustTime(t, "2024/01/01 10:15:00.000 +08:00")
+	end := mustTime(t, "2024/01/01 11:00:00.000 +08:00")
+
+	trim := func(name, logtype, content string) string {
+		t.Helper()
+		src := writeFile(t, dir, name, content)
+		dst := filepath.Join(dir, "out", name)
+		_, found, err := trimToRange(src, dst, lineTimeOf(logtype), start, end)
+		assert.NoError(err, name)
+		assert.True(found, name)
+		out, err := os.ReadFile(dst)
+		assert.NoError(err, name)
+		return string(out)
+	}
+
+	// a component log record with a stack trace attached
+	stdLog := `[2024/01/01 10:00:00.000 +08:00] [INFO] [mod.rs:1] ["before"]
+[2024/01/01 10:30:00.000 +08:00] [ERROR] [mod.rs:2] ["inside"]
+  at foo.rs:10
+  at bar.rs:20
+[2024/01/01 12:00:00.000 +08:00] [INFO] [mod.rs:3] ["after"]
+`
+	assert.Equal(`[2024/01/01 10:30:00.000 +08:00] [ERROR] [mod.rs:2] ["inside"]
+  at foo.rs:10
+  at bar.rs:20
+`, trim("tikv.log", LogTypeStd, stdLog))
+
+	// a slow query record: only the head line carries the time, the body has to
+	// follow it
+	slowLog := `# Time: 2024-01-01T10:00:00.000000+08:00
+# User: u
+select 1;
+# Time: 2024-01-01T10:30:00.000000+08:00
+# User: u
+select 2;
+# Time: 2024-01-01T12:00:00.000000+08:00
+# User: u
+select 3;
+`
+	assert.Equal(`# Time: 2024-01-01T10:30:00.000000+08:00
+# User: u
+select 2;
+`, trim("tidb_slow_query.log", LogTypeSlow, slowLog))
+}
+
 func TestLineTimeOfDispatchesEachType(t *testing.T) {
 	assert := require.New(t)
 
