@@ -14,6 +14,7 @@
 package scraper
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,22 @@ import (
 	"github.com/pingcap/diag/collector/log/parser"
 	"github.com/stretchr/testify/require"
 )
+
+// rocksdbJSONFixture is the same log written through TiKV's JSON formatter,
+// which is used for every drain - rocksdb included - when log.format = "json".
+// The keys are the ones TiKV emits: time, level, caller, message.
+const rocksdbJSONFixture = `{"time":"2024/01/01 09:59:59.000 +08:00","level":"INFO","caller":"db/version_set.cc:1","message":"RocksDB version: 8.11.3"}
+{"time":"2024/01/01 10:00:00.000 +08:00","level":"INFO","caller":"db/x.cc:1","message":"first message"}
+{"time":"2024/01/01 10:30:00.000 +08:00","level":"WARN","caller":"db/x.cc:1","message":"second message"}
+{"time":"2024/01/01 12:00:00.000 +08:00","level":"INFO","caller":"db/x.cc:1","message":"fourth message"}
+`
+
+func mustStat(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	fi, err := os.Stat(path)
+	require.NoError(t, err)
+	return fi
+}
 
 // A rocksdb log as TiKV writes it. Every line is stamped, including the RocksDB
 // version and options block: RocksDB emits that block through
@@ -314,4 +331,280 @@ func TestLogScraperTrimFallsBackToWholeFile(t *testing.T) {
 		"the original file is reported when nothing can be trimmed")
 	_, err := os.Stat(trimmedPath(trimDir, fp))
 	assert.True(os.IsNotExist(err), "no trimmed copy must be left behind")
+}
+
+// ---------------------------------------------------------------------------
+// every format TiKV can write
+// ---------------------------------------------------------------------------
+
+// TestRocksDBTrimsEveryLogFormat is the guard for the whole class of "the file
+// is recognised by its name, but its content is not what we assumed" bugs: a
+// format that is not understood makes the trimming silently degrade to
+// collecting the file in full, which is exactly the defect this feature fixes.
+// A new format needs a row here.
+func TestRocksDBTrimsEveryLogFormat(t *testing.T) {
+	assert := require.New(t)
+	start := mustTime(t, "2024/01/01 10:15:00.000 +08:00")
+	end := mustTime(t, "2024/01/01 11:00:00.000 +08:00")
+
+	cases := []struct {
+		name     string
+		content  string
+		expected string
+	}{
+		{
+			name:    "text",
+			content: rocksdbFixture,
+			expected: `[2024/01/01 10:30:00.000 +08:00][12345][INFO] second message
+[2024/01/01 11:00:00.000 +08:00][12345][WARN] third message
+  continuation of the third message
+`,
+		},
+		{
+			name:    "json",
+			content: rocksdbJSONFixture,
+			expected: `{"time":"2024/01/01 10:30:00.000 +08:00","level":"WARN","caller":"db/x.cc:1","message":"second message"}
+`,
+		},
+	}
+
+	for _, cs := range cases {
+		dir := t.TempDir()
+		src := writeFile(t, dir, "rocksdb.info", cs.content)
+		dst := filepath.Join(dir, "out", "rocksdb.info")
+
+		// line level: only the records inside the window survive
+		written, found, err := trimToRange(src, dst, rocksDBLineTime, start, end)
+		assert.NoError(err, cs.name)
+		assert.True(found, "%s: no timestamp recognised, trimming would silently be skipped", cs.name)
+		content, err := os.ReadFile(dst)
+		assert.NoError(err, cs.name)
+		assert.Equal(cs.expected, string(content), "%s: trimmed content", cs.name)
+		assert.Equal(int64(len(cs.expected)), written, cs.name)
+
+		// file level: a file that lies entirely after the window is dropped, so
+		// rotated logs outside the range are not downloaded at all
+		assert.False(fileHeadInRange(src, mustStat(t, src), rocksDBLineTime,
+			mustTime(t, "2024/01/01 08:00:00.000 +08:00"),
+			mustTime(t, "2024/01/01 09:00:00.000 +08:00")),
+			"%s: a file newer than the window must be excluded", cs.name)
+
+		assert.True(fileHeadInRange(src, mustStat(t, src), rocksDBLineTime,
+			mustTime(t, "2024/01/01 10:00:00.000 +08:00"),
+			mustTime(t, "2024/01/01 11:00:00.000 +08:00")),
+			"%s: a file overlapping the window must be kept", cs.name)
+	}
+}
+
+func TestLineTimeOfDispatchesEachType(t *testing.T) {
+	assert := require.New(t)
+
+	cases := []struct {
+		logtype string
+		line    string
+	}{
+		{LogTypeRocksDB, "[2024/01/01 10:00:00.000 +08:00][5][INFO] rocksdb"},
+		{LogTypeRocksDB, `{"time":"2024/01/01 10:00:00.000 +08:00","level":"INFO","caller":"x:1","message":"rocksdb"}`},
+		{LogTypeStd, `[2024/01/01 10:00:00.000 +08:00] [INFO] [mod.rs:1] ["msg"]`},
+		{LogTypeSlow, "# Time: 2024-01-01T10:00:00.000000+08:00"},
+	}
+	for _, cs := range cases {
+		extract := lineTimeOf(cs.logtype)
+		assert.NotNil(extract, cs.logtype)
+		got, ok := extract([]byte(cs.line))
+		assert.True(ok, "%s: %s", cs.logtype, cs.line)
+		assert.Equal("2024/01/01 10:00:00.000 +08:00", got.Format(parser.TimeStampLayout), cs.logtype)
+	}
+
+	assert.Nil(lineTimeOf(LogTypeUnknown), "unknown logs carry no per line timestamp")
+}
+
+// ---------------------------------------------------------------------------
+// the invariant, instead of a handful of examples
+// ---------------------------------------------------------------------------
+
+// TestTrimToRangeKeepsExactlyTheRecordsInRange is a property test: it builds a
+// log of multi-line records at known times and checks, for every kind of
+// window, that the output holds exactly the records inside it together with
+// their continuation lines - no boundary, continuation or last-line rule can
+// break without failing here.
+func TestTrimToRangeKeepsExactlyTheRecordsInRange(t *testing.T) {
+	assert := require.New(t)
+	dir := t.TempDir()
+
+	type record struct {
+		minute int
+		lines  []string
+	}
+	records := make([]record, 0, 12)
+	for i := 0; i < 12; i++ {
+		lines := []string{fmt.Sprintf("[2024/01/01 00:%02d:00.000 +08:00][%d][INFO] record %d", i, i, i)}
+		for c := 0; c <= i%3; c++ { // 0 to 2 continuation lines
+			lines = append(lines, fmt.Sprintf("  continuation %d of record %d", c, i))
+		}
+		records = append(records, record{minute: i, lines: lines})
+	}
+
+	var whole strings.Builder
+	for _, r := range records {
+		for _, l := range r.lines {
+			whole.WriteString(l + "\n")
+		}
+	}
+	src := writeFile(t, dir, "rocksdb.info", whole.String())
+
+	between := func(lo, hi int) string {
+		var b strings.Builder
+		for _, r := range records {
+			if r.minute < lo || r.minute > hi {
+				continue
+			}
+			for _, l := range r.lines {
+				b.WriteString(l + "\n")
+			}
+		}
+		return b.String()
+	}
+
+	windows := [][2]int{
+		{0, 0}, {5, 5}, {2, 7}, {0, 11}, {1, 3}, {9, 11},
+		{20, 30}, // nothing in range at all
+		{7, 4},   // start after end
+	}
+	for _, w := range windows {
+		dst := filepath.Join(dir, fmt.Sprintf("out-%d-%d", w[0], w[1]), "rocksdb.info")
+		start := mustTime(t, fmt.Sprintf("2024/01/01 00:%02d:00.000 +08:00", w[0]))
+		end := mustTime(t, fmt.Sprintf("2024/01/01 00:%02d:00.000 +08:00", w[1]))
+
+		written, found, err := trimToRange(src, dst, rocksDBLineTime, start, end)
+		assert.NoError(err, "window %v", w)
+		assert.True(found, "window %v", w)
+
+		content, err := os.ReadFile(dst)
+		assert.NoError(err, "window %v", w)
+		assert.Equal(between(w[0], w[1]), string(content), "window %v", w)
+		assert.Equal(int64(len(between(w[0], w[1]))), written, "window %v", w)
+	}
+}
+
+// TestTrimToRangeLineBoundaries guards the byte level rules: a record must not
+// disappear because of how the file ends, which line separator it uses, or how
+// long a single line is.
+func TestTrimToRangeLineBoundaries(t *testing.T) {
+	assert := require.New(t)
+	dir := t.TempDir()
+	start := mustTime(t, "2024/01/01 10:15:00.000 +08:00")
+	end := mustTime(t, "2024/01/01 11:00:00.000 +08:00")
+
+	trim := func(name, content string) string {
+		t.Helper()
+		src := writeFile(t, dir, name, content)
+		dst := filepath.Join(dir, "out", name)
+		_, found, err := trimToRange(src, dst, rocksDBLineTime, start, end)
+		assert.NoError(err, name)
+		assert.True(found, name)
+		out, err := os.ReadFile(dst)
+		assert.NoError(err, name)
+		return string(out)
+	}
+
+	// a missing final newline must not cost the last record
+	assert.Equal("[2024/01/01 10:30:00.000 +08:00][1][INFO] last",
+		trim("nonewline.info", "[2024/01/01 10:30:00.000 +08:00][1][INFO] last"))
+
+	// CRLF is kept byte for byte
+	assert.Equal("[2024/01/01 10:30:00.000 +08:00][1][INFO] a\r\n",
+		trim("crlf.info",
+			"[2024/01/01 10:30:00.000 +08:00][1][INFO] a\r\n"+
+				"[2024/01/01 12:00:00.000 +08:00][1][INFO] b\r\n"))
+
+	// a line far longer than any internal buffer is neither split nor dropped
+	long := "[2024/01/01 10:30:00.000 +08:00][1][INFO] " + strings.Repeat("x", 512*1024) + "\n"
+	assert.Equal(long, trim("long.info", long+
+		"[2024/01/01 12:00:00.000 +08:00][1][INFO] after\n"))
+}
+
+// ---------------------------------------------------------------------------
+// never lose data: the fallbacks
+// ---------------------------------------------------------------------------
+
+// TestTrimFallsBackWhenTheCopyCannotBeWritten: if the trimmed copy can not be
+// produced the original file has to be collected, never an empty one and never
+// an error that aborts the collection.
+func TestTrimFallsBackWhenTheCopyCannotBeWritten(t *testing.T) {
+	assert := require.New(t)
+	dir := t.TempDir()
+	src := writeFile(t, dir, "rocksdb.info", rocksdbFixture)
+	// a regular file where the trim directory should be, so nothing can be
+	// created below it
+	blocker := writeFile(t, dir, "not-a-dir", "")
+
+	s := &LogScraper{
+		Paths:   []string{filepath.Join(dir, "rocksdb.info")},
+		Types:   map[string]bool{LogTypeRocksDB: true},
+		Start:   mustTime(t, "2024/01/01 10:15:00.000 +08:00"),
+		End:     mustTime(t, "2024/01/01 11:00:00.000 +08:00"),
+		Trim:    true,
+		TrimDir: blocker,
+	}
+	sample := &Sample{}
+	assert.NoError(s.Scrap(sample))
+
+	assert.Len(sample.Log, 1)
+	assert.Equal(int64(len(rocksdbFixture)), sample.Log[src],
+		"the original file must be collected when the trimmed copy fails")
+}
+
+// TestTrimIsANoOpForUntrimmableTypes: a type without per line timestamps can
+// not be trimmed, and --trim must then behave as if it were not given.
+func TestTrimIsANoOpForUntrimmableTypes(t *testing.T) {
+	assert := require.New(t)
+	dir := t.TempDir()
+	trimDir := t.TempDir()
+	content := "no timestamp here\nanother line\n"
+	src := writeFile(t, dir, "mystery.dat", content)
+
+	s := &LogScraper{
+		Paths:   []string{filepath.Join(dir, "*")},
+		Types:   map[string]bool{LogTypeUnknown: true},
+		Start:   mustTime(t, "2024/01/01 10:00:00.000 +08:00"),
+		End:     mustTime(t, "2024/01/01 11:00:00.000 +08:00"),
+		Trim:    true,
+		TrimDir: trimDir,
+	}
+	sample := &Sample{}
+	assert.NoError(s.Scrap(sample))
+
+	assert.Len(sample.Log, 1)
+	assert.Equal(int64(len(content)), sample.Log[src])
+	entries, err := os.ReadDir(trimDir)
+	assert.NoError(err)
+	assert.Empty(entries, "nothing may be written for a type that cannot be trimmed")
+}
+
+// TestLogScraperSkipsDirectories: the glob used in production is
+// "<data dir>/*", and a TiKV data directory contains sub directories such as
+// db, raft and snap.
+func TestLogScraperSkipsDirectories(t *testing.T) {
+	assert := require.New(t)
+	dataDir := t.TempDir()
+	trimDir := t.TempDir()
+	assert.NoError(os.MkdirAll(filepath.Join(dataDir, "db"), 0o755))
+	assert.NoError(os.MkdirAll(filepath.Join(dataDir, "raft"), 0o755))
+	src := writeFile(t, dataDir, "rocksdb.info", rocksdbFixture)
+
+	s := &LogScraper{
+		Paths:   []string{filepath.Join(dataDir, "*")},
+		Types:   map[string]bool{LogTypeRocksDB: true},
+		Start:   mustTime(t, "2024/01/01 10:15:00.000 +08:00"),
+		End:     mustTime(t, "2024/01/01 11:00:00.000 +08:00"),
+		Trim:    true,
+		TrimDir: trimDir,
+	}
+	sample := &Sample{}
+	assert.NoError(s.Scrap(sample))
+
+	assert.Len(sample.Log, 1, "only the file, never a directory")
+	_, ok := sample.Log[trimmedPath(trimDir, src)]
+	assert.True(ok)
 }

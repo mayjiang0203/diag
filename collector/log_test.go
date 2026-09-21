@@ -2,11 +2,170 @@ package collector
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/pingcap/diag/scraper"
+	"github.com/pingcap/tiup/pkg/cluster/task"
 	"github.com/stretchr/testify/require"
 )
+
+// ---------------------------------------------------------------------------
+// the lifetime of what the collector writes on the target hosts
+// ---------------------------------------------------------------------------
+
+// TestTrimDirOutlivesOtherCollectors guards a whole class of regressions rather
+// than one instance of it: the trimmed rocksdb logs are written during Prepare
+// and downloaded during Collect, so they must not be stored anywhere another
+// collector deletes while it collects. system, TSDB (raw monitor mode) and
+// config all remove task.CheckToolsPathDir, and system and TSDB are registered
+// before the log collector, so a trim directory below it is gone by the time
+// the download starts and the rocksdb logs silently miss from the package.
+func TestTrimDirOutlivesOtherCollectors(t *testing.T) {
+	assert := require.New(t)
+
+	shared := hostTmpDirRemovedByOtherCollectors()
+	assert.NotEmpty(shared, "the dirs other collectors remove must be declared")
+
+	for _, dir := range shared {
+		assert.False(isWithin(dir, trimDir()),
+			"the trim dir %q lives inside %q, which another collector removes before the log collector downloads its files",
+			trimDir(), dir)
+	}
+}
+
+// TestLogCollectorRemovesItsOwnTrimDir: whatever a collector creates on the
+// target host it also has to clean up, otherwise the copies leak.
+func TestLogCollectorRemovesItsOwnTrimDir(t *testing.T) {
+	assert := require.New(t)
+
+	cleaned := logCleanupDirs()
+	assert.Contains(cleaned, trimDir())
+	assert.Contains(cleaned, task.CheckToolsPathDir)
+}
+
+// TestPrepareCollectsNothingWithoutAType pins the early return of Prepare
+// itself, not just the predicate behind it: selecting nothing, or only log.ops
+// (which the audit log collector owns), must not walk the topology, must not
+// build any task and must not fail.
+func TestPrepareCollectsNothingWithoutAType(t *testing.T) {
+	assert := require.New(t)
+
+	for _, c := range []collectLog{{}, {Ops: true}} {
+		opt := &LogCollectOptions{collector: c}
+		// the cluster is nil on purpose: returning before it is dereferenced is
+		// part of what this asserts
+		stats, err := opt.Prepare(&Manager{mode: CollectModeTiUP}, nil)
+		assert.NoError(err)
+		assert.Nil(stats, "collector %+v", c)
+	}
+
+	// an unknown collection mode is a no-op as well, and must not panic
+	opt := &LogCollectOptions{collector: collectLog{Rocksdb: true}}
+	stats, err := opt.Prepare(&Manager{mode: "not-a-mode"}, nil)
+	assert.NoError(err)
+	assert.Nil(stats)
+}
+
+// isWithin reports whether child is inside parent.
+func isWithin(parent, child string) bool {
+	rel, err := filepath.Rel(parent, child)
+	return err == nil && rel != "." && rel != ".." &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// ---------------------------------------------------------------------------
+// what the collectors ask the scraper to do
+// ---------------------------------------------------------------------------
+
+// noEmptyFlagValue fails when a command ends with a flag that got no value: that
+// shape made the scraper exit with "flag needs an argument: --logtype" and
+// abort the whole collection, so it must never be generated again.
+func noEmptyFlagValue(t *testing.T, cmd string) {
+	t.Helper()
+	assert := require.New(t)
+	assert.NotEmpty(cmd)
+	assert.NotRegexp(`--[a-zA-Z-]+\s*$`, cmd, "command ends with a flag without a value: %s", cmd)
+}
+
+func TestRocksDBScraperCmdTrims(t *testing.T) {
+	assert := require.New(t)
+
+	cmd := rocksdbScraperCmd("/data/db/data/tikv-20160",
+		"2026-09-21T09:00:00+08:00", "2026-09-21T10:00:00+08:00", "/tmp/diag-trimmed")
+	noEmptyFlagValue(t, cmd)
+
+	assert.Contains(cmd, "--log '/data/db/data/tikv-20160/*'")
+	assert.Contains(cmd, "-f '2026-09-21T09:00:00+08:00'")
+	assert.Contains(cmd, "-t '2026-09-21T10:00:00+08:00'")
+	assert.Contains(cmd, "--logtype rocksdb")
+	assert.Contains(cmd, "--trim --trim-dir '/tmp/diag-trimmed'")
+	assert.True(strings.HasPrefix(cmd, scraperPath()), cmd)
+}
+
+func TestGenericScraperCmdNeedsAtLeastOneType(t *testing.T) {
+	assert := require.New(t)
+
+	// no type of the component log directories requested: no command at all,
+	// the step has to be skipped instead of being run with a bare --logtype
+	cmd, ok := genericScraperCmd([]string{"/data/pd-2379/log/*"}, "b", "e", nil)
+	assert.False(ok)
+	assert.Empty(cmd)
+
+	cmd, ok = genericScraperCmd([]string{"/data/pd-2379/log/*"}, "b", "e", []string{scraper.LogTypeStd})
+	assert.True(ok)
+	assert.Contains(cmd, "--log '/data/pd-2379/log/*'")
+	assert.Contains(cmd, "--logtype std")
+	noEmptyFlagValue(t, cmd)
+}
+
+// TestScraperCommandsNeverCarryAnEmptyFlagValue walks every combination of the
+// collectLog switches: this is the class of the "flag needs an argument"
+// failure, which must not come back whatever the user selects.
+func TestScraperCommandsNeverCarryAnEmptyFlagValue(t *testing.T) {
+	assert := require.New(t)
+	paths := []string{"/data/pd-2379/log/*", "/data/tikv-20160/log/*"}
+
+	for i := 0; i < 16; i++ {
+		opt := &LogCollectOptions{collector: collectLog{
+			Std:     i&1 != 0,
+			Slow:    i&2 != 0,
+			Unknown: i&4 != 0,
+			Ops:     i&8 != 0,
+		}}
+		cmd, ok := genericScraperCmd(paths, "b", "e", opt.logTypesToScrap())
+		if !ok {
+			continue
+		}
+		noEmptyFlagValue(t, cmd)
+		assert.Regexp(`--logtype \S+`, cmd)
+	}
+}
+
+// TestNeedsCollectMatchesTheSelectedTypes pins the semantics of the early
+// return: everything the user can ask for is collected, log.ops is not (the
+// audit log collector owns it), and the predicate is derived from
+// logTypesToScrap so the two can not drift apart again - keeping them in sync
+// by hand is how log.unknown once ended up collected by nobody.
+func TestNeedsCollectMatchesTheSelectedTypes(t *testing.T) {
+	assert := require.New(t)
+
+	for _, std := range []bool{false, true} {
+		for _, slow := range []bool{false, true} {
+			for _, unknown := range []bool{false, true} {
+				for _, rocksdb := range []bool{false, true} {
+					for _, ops := range []bool{false, true} {
+						opt := &LogCollectOptions{collector: collectLog{
+							Std: std, Slow: slow, Unknown: unknown, Rocksdb: rocksdb, Ops: ops,
+						}}
+						assert.Equal(std || slow || unknown || rocksdb, opt.needsCollect(),
+							"std=%v slow=%v unknown=%v rocksdb=%v ops=%v", std, slow, unknown, rocksdb, ops)
+					}
+				}
+			}
+		}
+	}
+}
 
 func TestPathInPackage(t *testing.T) {
 	assert := require.New(t)
@@ -31,6 +190,15 @@ func TestPathInPackage(t *testing.T) {
 	assert.Equal(
 		filepath.Join("/tmp/result", "127.0.0.1", "/tmp/tiup"),
 		pathInPackage("/tmp/result", "127.0.0.1", "/tmp/tiup"),
+	)
+	// only the real trim dir is stripped: a file below the shared tools dir
+	// keeps its path, so a wrong trim location shows up in the package instead
+	// of being quietly rewritten
+	assert.Equal(
+		filepath.Join("/tmp/result", "127.0.0.1",
+			filepath.Join(task.CheckToolsPathDir, "trimmed", "rocksdb.info")),
+		pathInPackage("/tmp/result", "127.0.0.1",
+			filepath.Join(task.CheckToolsPathDir, "trimmed", "rocksdb.info")),
 	)
 }
 
