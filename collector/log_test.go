@@ -1,11 +1,38 @@
 package collector
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/pingcap/diag/scraper"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPathInPackage(t *testing.T) {
+	assert := require.New(t)
+
+	// a trimmed rocksdb log keeps its place in the package instead of showing
+	// the temporary directory it was written to on the remote host
+	assert.Equal(
+		filepath.Join("/tmp/result", "127.0.0.1", "data/tikv-20160/rocksdb.info"),
+		pathInPackage("/tmp/result", "127.0.0.1",
+			filepath.Join(trimDir(), "data/tikv-20160/rocksdb.info")),
+	)
+	// any other file keeps its absolute path, as before
+	assert.Equal(
+		filepath.Join("/tmp/result", "127.0.0.1", "/data/tikv-20160/log/tikv.log"),
+		pathInPackage("/tmp/result", "127.0.0.1", "/data/tikv-20160/log/tikv.log"),
+	)
+	// the trim directory itself and its parent are not treated as trimmed files
+	assert.Equal(
+		filepath.Join("/tmp/result", "127.0.0.1", trimDir()),
+		pathInPackage("/tmp/result", "127.0.0.1", trimDir()),
+	)
+	assert.Equal(
+		filepath.Join("/tmp/result", "127.0.0.1", "/tmp/tiup"),
+		pathInPackage("/tmp/result", "127.0.0.1", "/tmp/tiup"),
+	)
+}
 
 func TestLogTypesToScrap(t *testing.T) {
 	assert := require.New(t)

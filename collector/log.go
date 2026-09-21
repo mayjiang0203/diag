@@ -41,7 +41,30 @@ import (
 const (
 	// componentDiagCollector is the component name of diagnostic collector
 	componentDiagCollector = "diag"
+
+	// trimDirName is the sub directory of task.CheckToolsPathDir holding the
+	// time range trimmed copies of the rocksdb logs. It is removed together
+	// with the collecting tools once the files have been downloaded.
+	trimDirName = "trimmed"
 )
+
+// trimDir is where the scraper writes the time range trimmed rocksdb logs.
+func trimDir() string {
+	return filepath.Join(task.CheckToolsPathDir, trimDirName)
+}
+
+// pathInPackage returns the path a collected file gets inside the package. A
+// trimmed copy is reported by the scraper with its absolute temporary path,
+// which must not leak into the package: it is placed where the original file
+// would have been.
+func pathInPackage(resultDir, host, target string) string {
+	rel, err := filepath.Rel(trimDir(), target)
+	if err == nil && rel != "." && rel != ".." &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return filepath.Join(resultDir, host, rel)
+	}
+	return filepath.Join(resultDir, host, target)
+}
 
 type collectLog struct {
 	Std     bool
@@ -189,14 +212,20 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 
 			// Placing this code here is not elegant, but it can avoid encountering unknown files from collecting datadir.
 			if c.collector.Rocksdb && inst.ComponentName() == spec.ComponentTiKV {
+				// --trim keeps only the rocksdb lines inside the requested time
+				// range. A data directory accumulates one rocksdb.info per
+				// rotation and TiKV never deletes the rotated ones
+				// (log.file.max-backups defaults to 0), so collecting them in
+				// full is both slow and useless.
 				hostTasks[inst.GetHost()].
 					Shell(
 						inst.GetHost(),
-						fmt.Sprintf("%s --log '%s' -f '%s' -t '%s' --logtype %s",
+						fmt.Sprintf("%s --log '%s' -f '%s' -t '%s' --logtype %s --trim --trim-dir '%s'",
 							filepath.Join(task.CheckToolsPathDir, "bin", "scraper"),
 							fmt.Sprintf("%s/*", inst.DataDir()),
 							c.ScrapeBegin, c.ScrapeEnd,
 							scraper.LogTypeRocksDB,
+							trimDir(),
 						),
 						"",
 						false,
@@ -336,7 +365,7 @@ func (c *LogCollectOptions) Collect(m *Manager, cls *models.TiDBCluster) error {
 					// check for listening ports
 					CopyFile(
 						f.Target,
-						filepath.Join(c.resultDir, inst.GetHost(), f.Target),
+						pathInPackage(c.resultDir, inst.GetHost(), f.Target),
 						inst.GetHost(),
 						true,
 						c.limit,
