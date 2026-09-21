@@ -103,6 +103,24 @@ func TestRocksDBScraperCmdTrims(t *testing.T) {
 	assert.True(strings.HasPrefix(cmd, scraperPath()), cmd)
 }
 
+// TestOnlyRocksDBScrapesAreTrimmed pins the scope of the trimming: it is meant
+// for the rocksdb logs only. Turning it on for the component log directories
+// would change what every existing user gets - the active file is cut at both
+// ends and the default range is only the last two hours, while the start of the
+// file is often what a diagnosis needs - and it would also empty the stderr
+// logs, which are deliberately collected regardless of the time range.
+func TestOnlyRocksDBScrapesAreTrimmed(t *testing.T) {
+	assert := require.New(t)
+
+	generic, ok := genericScraperCmd([]string{"/data/pd-2379/log/*"}, "b", "e",
+		[]string{scraper.LogTypeStd, scraper.LogTypeSlow})
+	assert.True(ok)
+	assert.NotContains(generic, "--trim", "component logs are collected whole on purpose")
+
+	assert.Contains(rocksdbScraperCmd("/data/db/data/tikv-20160", "b", "e", "/tmp/diag-trimmed"),
+		"--trim", "rocksdb logs are the ones that get trimmed")
+}
+
 func TestGenericScraperCmdNeedsAtLeastOneType(t *testing.T) {
 	assert := require.New(t)
 
