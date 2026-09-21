@@ -42,15 +42,39 @@ const (
 	// componentDiagCollector is the component name of diagnostic collector
 	componentDiagCollector = "diag"
 
-	// trimDirName is the sub directory of task.CheckToolsPathDir holding the
-	// time range trimmed copies of the rocksdb logs. It is removed together
-	// with the collecting tools once the files have been downloaded.
-	trimDirName = "trimmed"
+	// trimDirName is the directory holding the time range trimmed copies of the
+	// rocksdb logs. It belongs to the log collector, which removes it once the
+	// files have been downloaded.
+	trimDirName = "diag-trimmed"
 )
 
 // trimDir is where the scraper writes the time range trimmed rocksdb logs.
+//
+// The trimmed copies are created by Prepare and downloaded by Collect, so they
+// have to survive the Collect phase of the other collectors. task.CheckToolsPathDir
+// is removed by the system, TSDB and config collectors while they collect, and
+// those run before the log collector (they are registered first in
+// buildCollectors), which would leave nothing to download. Hence a directory of
+// our own next to it, never below it.
 func trimDir() string {
-	return filepath.Join(task.CheckToolsPathDir, trimDirName)
+	return filepath.Join(filepath.Dir(task.CheckToolsPathDir), trimDirName)
+}
+
+// logCleanupDirs are the directories the log collector removes from the target
+// hosts once its files have been downloaded.
+func logCleanupDirs() []string {
+	return []string{task.CheckToolsPathDir, trimDir()}
+}
+
+// hostTmpDirRemovedByOtherCollectors lists the directories on the target hosts
+// that other collectors remove during their own Collect phase: the system
+// collector, the TSDB one (raw monitor mode) and the config one all delete
+// task.CheckToolsPathDir. Anything the log collector must keep from its Prepare
+// until its Collect has to stay outside of them, because those collectors are
+// registered first and therefore collect first. Add a directory here when a new
+// collector starts removing one.
+func hostTmpDirRemovedByOtherCollectors() []string {
+	return []string{task.CheckToolsPathDir}
 }
 
 // pathInPackage returns the path a collected file gets inside the package. A
@@ -130,11 +154,47 @@ func (c *LogCollectOptions) logTypesToScrap() []string {
 	return logTypes
 }
 
+// needsCollect reports whether the collector has anything to do. It derives
+// from logTypesToScrap so that the two can not drift apart: keeping them in
+// sync by hand is how log.unknown ended up being collected by nobody.
+func (c *LogCollectOptions) needsCollect() bool {
+	return len(c.logTypesToScrap()) > 0 || c.collector.Rocksdb
+}
+
+// scraperPath is where the scraper binary is found on the target hosts.
+func scraperPath() string {
+	return filepath.Join(task.CheckToolsPathDir, "bin", "scraper")
+}
+
+// genericScraperCmd builds the command scraping the component log directories.
+// ok is false when no type of those directories is requested: the step then
+// must not be built at all, because the scraper is invoked with a bare
+// --logtype and pflag rejects a flag without value with
+// "flag needs an argument: --logtype", which aborts the whole collection.
+func genericScraperCmd(paths []string, begin, end string, logTypes []string) (cmd string, ok bool) {
+	if len(logTypes) == 0 {
+		return "", false
+	}
+	return fmt.Sprintf("%s --log '%s' -f '%s' -t '%s' --logtype %s",
+		scraperPath(), strings.Join(paths, ","), begin, end,
+		strings.Join(logTypes, ",")), true
+}
+
+// rocksdbScraperCmd builds the command scraping the rocksdb logs of one TiKV
+// data directory. --trim keeps only the lines inside [begin, end]: a data
+// directory accumulates one rocksdb.info per rotation and TiKV never deletes
+// the rotated ones by default (log.file.max-backups and max-days are 0), so
+// shipping them in full is both slow and useless.
+func rocksdbScraperCmd(dataDir, begin, end, outDir string) string {
+	return fmt.Sprintf("%s --log '%s/*' -f '%s' -t '%s' --logtype %s --trim --trim-dir '%s'",
+		scraperPath(), dataDir, begin, end, scraper.LogTypeRocksDB, outDir)
+}
+
 // Prepare implements the Collector interface
 func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[string][]CollectStat, error) {
 	switch m.mode {
 	case CollectModeTiUP:
-		if !(c.collector.Std || c.collector.Slow || c.collector.Unknown || c.collector.Rocksdb) {
+		if !c.needsCollect() {
 			return nil, nil
 		}
 	case CollectModeK8s:
@@ -220,13 +280,7 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 				hostTasks[inst.GetHost()].
 					Shell(
 						inst.GetHost(),
-						fmt.Sprintf("%s --log '%s' -f '%s' -t '%s' --logtype %s --trim --trim-dir '%s'",
-							filepath.Join(task.CheckToolsPathDir, "bin", "scraper"),
-							fmt.Sprintf("%s/*", inst.DataDir()),
-							c.ScrapeBegin, c.ScrapeEnd,
-							scraper.LogTypeRocksDB,
-							trimDir(),
-						),
+						rocksdbScraperCmd(inst.DataDir(), c.ScrapeBegin, c.ScrapeEnd, trimDir()),
 						"",
 						false,
 					).
@@ -263,16 +317,11 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 		// the scraper would be invoked with an empty --logtype value, which
 		// makes it fail with "flag needs an argument: --logtype" and aborts the
 		// whole collection (e.g. `--include=log.rocksdb`).
-		if len(scraperLogType) > 0 {
+		if cmd, ok := genericScraperCmd(hostPaths[host].Slice(), c.ScrapeBegin, c.ScrapeEnd, scraperLogType); ok {
 			t = t.
 				Shell(
 					host,
-					fmt.Sprintf("%s --log '%s' -f '%s' -t '%s' --logtype %s",
-						filepath.Join(task.CheckToolsPathDir, "bin", "scraper"),
-						strings.Join(hostPaths[host].Slice(), ","),
-						c.ScrapeBegin, c.ScrapeEnd,
-						strings.Join(scraperLogType, ","),
-					),
+					cmd,
 					"",
 					false,
 				).
@@ -381,8 +430,10 @@ func (c *LogCollectOptions) Collect(m *Manager, cls *models.TiDBCluster) error {
 			if err != nil {
 				return err
 			}
+			// remove both the collecting tools and the trimmed copies this
+			// collector wrote during Prepare
 			t3 := b.
-				Rmdir(inst.GetHost(), task.CheckToolsPathDir).
+				Rmdir(inst.GetHost(), logCleanupDirs()...).
 				BuildAsStep(fmt.Sprintf("  - Cleanup temp files on %s:%d", inst.GetHost(), inst.GetSSHPort()))
 			cleanTasks = append(cleanTasks, t3)
 		}

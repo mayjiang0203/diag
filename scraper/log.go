@@ -205,6 +205,7 @@ var rocksDBTimeRE = regexp.MustCompile(`^\[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\
 var (
 	stdParsers     = parser.ListStd()
 	slowQueryParse = &parser.SlowQueryParser{}
+	jsonLogLine    = &parser.UnifiedJSONLogParser{}
 )
 
 // lineTime extracts the timestamp a log line starts with. It reports false for
@@ -213,15 +214,21 @@ var (
 type lineTime func(line []byte) (time.Time, bool)
 
 func rocksDBLineTime(line []byte) (time.Time, bool) {
-	m := rocksDBTimeRE.FindSubmatch(line)
-	if m == nil {
-		return time.Time{}, false
+	if m := rocksDBTimeRE.FindSubmatch(line); m != nil {
+		if t, err := time.Parse(parser.TimeStampLayout, string(m[1])); err == nil {
+			return t, true
+		}
 	}
-	t, err := time.Parse(parser.TimeStampLayout, string(m[1]))
-	if err != nil {
-		return time.Time{}, false
+	// The very same logs go through TiKV's JSON formatter when
+	// log.format = "json" (keys: time, level, caller, message), and a rocksdb
+	// log file is recognised by its name, so the text shape can not be assumed.
+	// The cheap first byte check keeps the JSON parser off the text path.
+	if len(line) > 0 && line[0] == '{' {
+		if t, _ := jsonLogLine.ParseHead(line); t != nil {
+			return *t, true
+		}
 	}
-	return t, true
+	return time.Time{}, false
 }
 
 func stdLineTime(line []byte) (time.Time, bool) {
