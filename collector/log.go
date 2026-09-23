@@ -66,17 +66,6 @@ func logCleanupDirs() []string {
 	return []string{task.CheckToolsPathDir, trimDir()}
 }
 
-// hostTmpDirRemovedByOtherCollectors lists the directories on the target hosts
-// that other collectors remove during their own Collect phase: the system
-// collector, the TSDB one (raw monitor mode) and the config one all delete
-// task.CheckToolsPathDir. Anything the log collector must keep from its Prepare
-// until its Collect has to stay outside of them, because those collectors are
-// registered first and therefore collect first. Add a directory here when a new
-// collector starts removing one.
-func hostTmpDirRemovedByOtherCollectors() []string {
-	return []string{task.CheckToolsPathDir}
-}
-
 // pathInPackage returns the path a collected file gets inside the package. A
 // trimmed copy is reported by the scraper with its absolute temporary path,
 // which must not leak into the package: it is placed where the original file

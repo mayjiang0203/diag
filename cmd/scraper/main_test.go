@@ -18,8 +18,24 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/pingcap/diag/scraper"
 	"github.com/stretchr/testify/require"
 )
+
+// resetCLI puts the flag state of the shared root command back to its initial
+// value. cobra keeps the values it parsed between Execute calls, so a second
+// run of this package - `go test -count=2`, or a shuffled order - would
+// otherwise inherit --trim-dir from the test that ran before it and the
+// validation under test would not trigger. The struct is reset in place because
+// the flags hold pointers into it.
+func resetCLI() {
+	*opt = scraper.Option{
+		LogPaths:    []string{},
+		ConfigPaths: []string{},
+		FilePaths:   []string{},
+		LogTypes:    map[string]bool{},
+	}
+}
 
 // TestCLIRejectsTrimWithoutTrimDir runs the cobra command instead of calling
 // the scraper directly: this validation lives in the command, so only executing
@@ -27,6 +43,7 @@ import (
 // bare --trim and the collection would abort.
 func TestCLIRejectsTrimWithoutTrimDir(t *testing.T) {
 	assert := require.New(t)
+	resetCLI()
 	dir := t.TempDir()
 	writeLog(t, dir, "rocksdb.info", scrapTextLog)
 
@@ -47,6 +64,7 @@ func TestCLIRejectsTrimWithoutTrimDir(t *testing.T) {
 // get through validation.
 func TestCLIAcceptsTrimWithTrimDir(t *testing.T) {
 	assert := require.New(t)
+	resetCLI()
 	dir, out := t.TempDir(), t.TempDir()
 	writeLog(t, dir, "rocksdb.info", scrapTextLog)
 

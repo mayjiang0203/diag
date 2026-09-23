@@ -56,24 +56,20 @@ func TestCollectScrapedStats(t *testing.T) {
 // the lifetime of what the collector writes on the target hosts
 // ---------------------------------------------------------------------------
 
-// TestTrimDirOutlivesOtherCollectors guards a whole class of regressions rather
-// than one instance of it: the trimmed rocksdb logs are written during Prepare
-// and downloaded during Collect, so they must not be stored anywhere another
-// collector deletes while it collects. system, TSDB (raw monitor mode) and
-// config all remove task.CheckToolsPathDir, and system and TSDB are registered
-// before the log collector, so a trim directory below it is gone by the time
-// the download starts and the rocksdb logs silently miss from the package.
+// TestTrimDirOutlivesOtherCollectors guards the lifetime of the trimmed copies:
+// they are written during Prepare and downloaded during Collect, so they must
+// not live where another collector deletes while it collects. system and TSDB
+// (raw monitor mode) remove task.CheckToolsPathDir during their own Collect and
+// are registered before the log collector, so a trim directory below it would be
+// gone by the time the download starts and the rocksdb logs would silently miss
+// from the package.
 func TestTrimDirOutlivesOtherCollectors(t *testing.T) {
 	assert := require.New(t)
 
-	shared := hostTmpDirRemovedByOtherCollectors()
-	assert.NotEmpty(shared, "the dirs other collectors remove must be declared")
-
-	for _, dir := range shared {
-		assert.False(isWithin(dir, trimDir()),
-			"the trim dir %q lives inside %q, which another collector removes before the log collector downloads its files",
-			trimDir(), dir)
-	}
+	assert.NotEqual(task.CheckToolsPathDir, trimDir())
+	assert.False(isWithin(task.CheckToolsPathDir, trimDir()),
+		"the trim dir %q must not live inside %q, which other collectors remove before the log collector downloads its files",
+		trimDir(), task.CheckToolsPathDir)
 }
 
 // TestLogCollectorRemovesItsOwnTrimDir: whatever a collector creates on the
@@ -130,37 +126,29 @@ func noEmptyFlagValue(t *testing.T, cmd string) {
 	assert.NotRegexp(`--[a-zA-Z-]+\s*$`, cmd, "command ends with a flag without a value: %s", cmd)
 }
 
-func TestRocksDBScraperCmdTrims(t *testing.T) {
+// TestScraperCommandShapes is the compact matrix of the two commands: the
+// rocksdb one is the only one that trims, and neither may carry a flag without
+// a value. The steps the collector really builds are asserted in
+// log_tiup_test.go, against a topology.
+func TestScraperCommandShapes(t *testing.T) {
 	assert := require.New(t)
 
-	cmd := rocksdbScraperCmd("/data/db/data/tikv-20160",
-		"2026-09-21T09:00:00+08:00", "2026-09-21T10:00:00+08:00", "/tmp/diag-trimmed")
-	noEmptyFlagValue(t, cmd)
+	rocks := rocksdbScraperCmd("/data/db/data/tikv-20160", "b", "e", "/tmp/diag-trimmed")
+	noEmptyFlagValue(t, rocks)
+	assert.True(strings.HasPrefix(rocks, scraperPath()), rocks)
+	assert.Contains(rocks, "--log '/data/db/data/tikv-20160/*'")
+	assert.Contains(rocks, "--logtype rocksdb --trim --trim-dir '/tmp/diag-trimmed'")
 
-	assert.Contains(cmd, "--log '/data/db/data/tikv-20160/*'")
-	assert.Contains(cmd, "-f '2026-09-21T09:00:00+08:00'")
-	assert.Contains(cmd, "-t '2026-09-21T10:00:00+08:00'")
-	assert.Contains(cmd, "--logtype rocksdb")
-	assert.Contains(cmd, "--trim --trim-dir '/tmp/diag-trimmed'")
-	assert.True(strings.HasPrefix(cmd, scraperPath()), cmd)
-}
-
-// TestOnlyRocksDBScrapesAreTrimmed pins the scope of the trimming: it is meant
-// for the rocksdb logs only. Turning it on for the component log directories
-// would change what every existing user gets - the active file is cut at both
-// ends and the default range is only the last two hours, while the start of the
-// file is often what a diagnosis needs - and it would also empty the stderr
-// logs, which are deliberately collected regardless of the time range.
-func TestOnlyRocksDBScrapesAreTrimmed(t *testing.T) {
-	assert := require.New(t)
-
+	// trimming is scoped to the rocksdb logs: cutting the component logs at
+	// both ends would change what every existing user gets, and would empty the
+	// stderr logs which are collected regardless of the time range on purpose
 	generic, ok := genericScraperCmd([]string{"/data/pd-2379/log/*"}, "b", "e",
 		[]string{scraper.LogTypeStd, scraper.LogTypeSlow})
 	assert.True(ok)
+	assert.Contains(generic, "--log '/data/pd-2379/log/*'")
+	assert.Contains(generic, "--logtype std,slow")
 	assert.NotContains(generic, "--trim", "component logs are collected whole on purpose")
-
-	assert.Contains(rocksdbScraperCmd("/data/db/data/tikv-20160", "b", "e", "/tmp/diag-trimmed"),
-		"--trim", "rocksdb logs are the ones that get trimmed")
+	noEmptyFlagValue(t, generic)
 }
 
 func TestGenericScraperCmdNeedsAtLeastOneType(t *testing.T) {

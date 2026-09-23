@@ -123,19 +123,40 @@ func TestBuildTiUPLogTasksWiring(t *testing.T) {
 	})
 }
 
-// TestBuildTiUPLogDownloadTasksCleansUp covers the other half of the lifetime of
-// the trimmed copies: they are removed together with the collecting tools.
-// Nobody else removes them - the system and TSDB collectors only remove the
-// shared tools directory - so without this the files would stay on the host.
-func TestBuildTiUPLogDownloadTasksCleansUp(t *testing.T) {
+// TestBuildTiUPLogDownloadTasks covers the two things Collect does with the file
+// list: download every entry to its place in the package, and remove the
+// trimmed copies together with the collecting tools afterwards. Nobody else
+// removes them - the system and TSDB collectors only remove the shared tools
+// directory - so without the cleanup they would stay on the host.
+func TestBuildTiUPLogDownloadTasks(t *testing.T) {
 	assert := require.New(t)
 	topo := testTiUPTopology(t)
 	opt := testLogOptions(collectLog{Rocksdb: true})
+	opt.resultDir = "/tmp/result"
+	opt.fileStats = map[string][]CollectStat{
+		"127.0.0.1": {
+			// a trimmed copy: it has to land where the original file would be
+			{Target: filepath.Join(trimDir(), "data/db/data/tikv-20160/rocksdb.info"), Size: 10},
+			// a file collected in place keeps its own path
+			{Target: "/data/db/deploy/tikv-20160/log/tikv.log", Size: 20},
+		},
+	}
 
-	_, clean, err := opt.buildTiUPLogDownloadTasks(testManager(), topo)
+	download, clean, err := opt.buildTiUPLogDownloadTasks(testManager(), topo)
 	assert.NoError(err)
 
-	rendered := renderSteps(clean)
-	assert.Contains(rendered, trimDir(), "the trimmed copies have to be cleaned up:\n%s", rendered)
-	assert.Contains(rendered, task.CheckToolsPathDir)
+	// the remote source stays under the trim directory, the local destination
+	// is the original location inside the package
+	rendered := renderSteps(download)
+	assert.Contains(rendered,
+		"remote=127.0.0.1:"+filepath.Join(trimDir(), "data/db/data/tikv-20160/rocksdb.info"))
+	assert.Contains(rendered,
+		"local="+filepath.Join("/tmp/result", "127.0.0.1", "data/db/data/tikv-20160/rocksdb.info"))
+	assert.Contains(rendered, "remote=127.0.0.1:/data/db/deploy/tikv-20160/log/tikv.log")
+	assert.Contains(rendered,
+		"local="+filepath.Join("/tmp/result", "127.0.0.1", "/data/db/deploy/tikv-20160/log/tikv.log"))
+
+	cleaned := renderSteps(clean)
+	assert.Contains(cleaned, trimDir(), "the trimmed copies have to be cleaned up:\n%s", cleaned)
+	assert.Contains(cleaned, task.CheckToolsPathDir)
 }
