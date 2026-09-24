@@ -237,10 +237,16 @@ type leftoverTrimmedLog struct {
 // name trimming gives its directories - and touches nothing: whether a matched
 // entry really belongs to this collector is decided by assertRemovableTrimDir,
 // in one place, before anything is removed. du -sk is POSIX, -b would need GNU.
+//
+// The loop is wrapped in sh -c to make the whole thing a single simple command.
+// Every executor prepends an assignment without a separator before the command
+// it runs (PATH=$PATH:/bin:... <command>), and a compound command can not follow
+// one: the host would report "syntax error near unexpected token `do'".
 func leftoverTrimmedLogsCmdIn(root string) string {
-	return fmt.Sprintf(
-		`for d in '%s'/%s*; do if [ -d "$d" ]; then printf '%%s\t%%s\n' "$d" "$(du -sk "$d" 2>/dev/null | cut -f1)"; fi; done`,
+	script := fmt.Sprintf(
+		`for d in "%s"/%s*; do if [ -d "$d" ]; then printf "%%s\t%%s\n" "$d" "$(du -sk "$d" 2>/dev/null | cut -f1)"; fi; done`,
 		root, trimDirPrefix)
+	return "sh -c '" + script + "'"
 }
 
 // leftoverTrimmedLogsCmd looks for trimmed logs where this run would put them.
@@ -345,12 +351,13 @@ func describeLeftoverTrimmedLogs(hosts []string, leftovers map[string][]leftover
 
 // confirmLeftoverTrimmedRemoval asks whether the leftovers may be removed. -y
 // answers yes to every confirmation, so it does not ask; neither does the flag
-// that asks for the removal explicitly.
-func (c *LogCollectOptions) confirmLeftoverTrimmedRemoval(desc string) bool {
+// that asks for the removal explicitly. What was found is reported by the
+// caller, so it is printed once, whether or not there is anyone to ask.
+func (c *LogCollectOptions) confirmLeftoverTrimmedRemoval() bool {
 	if c.cleanLeftover || c.skipConfirm {
 		return true
 	}
-	ok, _ := confirmRemoveLeftover(strings.TrimRight(desc, "\n") + "\nRemove them before collecting?")
+	ok, _ := confirmRemoveLeftover("Remove the leftover trimmed logs before collecting?")
 	return ok
 }
 
@@ -446,16 +453,17 @@ func (c *LogCollectOptions) cleanLeftoverTrimmedLogs(ctx context.Context, m *Man
 	}
 
 	desc, total := describeLeftoverTrimmedLogs(hosts, owned)
-	header := fmt.Sprintf("Found %s of trimmed logs from an interrupted collection in %s:", readableSize(total), trimDirRoot())
-	if !c.confirmLeftoverTrimmedRemoval(header + "\n" + desc) {
-		m.logger.Warnf("%s\n%s\nKeeping them: they are not part of this collection and a later one will ask again",
-			header, desc)
+	m.logger.Warnf("Found %s of trimmed logs from an interrupted collection in %s:\n%s",
+		readableSize(total), trimDirRoot(), strings.TrimRight(desc, "\n"))
+
+	if !c.confirmLeftoverTrimmedRemoval() {
+		m.logger.Warnf("Keeping them: they are not part of this collection, and a later one will ask again")
 		return nil
 	}
 	if err := c.removeLeftoverTrimmedLogs(ctx, m, topo, hosts, owned); err != nil {
 		return err
 	}
-	m.logger.Infof("%s\n%s\nRemoved them", header, desc)
+	m.logger.Infof("Removed the leftover trimmed logs of the previous collection")
 	return nil
 }
 

@@ -87,6 +87,38 @@ func TestOwnedTrimmedLogsKeepsForeignEntriesApart(t *testing.T) {
 // what the hosts are asked
 // ---------------------------------------------------------------------------
 
+// executorPrefix is what every cluster executor puts in front of the command it
+// runs, remote or local (tiup pkg/cluster/executor/ssh.go and local.go). It ends
+// with a space and carries no separator, so whatever follows it has to be a
+// single simple command: a bare `for ... done` is a syntax error on the host,
+// which only a real host - or a test that goes through the same prefix - shows.
+const executorPrefix = "export LANG=C; PATH=$PATH:/bin:/sbin:/usr/bin:/usr/sbin "
+
+// runLikeAnExecutor runs cmd the way a target host receives it.
+func runLikeAnExecutor(t *testing.T, cmd string) string {
+	t.Helper()
+	out, err := exec.Command("sh", "-c", executorPrefix+cmd).Output()
+	require.NoError(t, err, "output: %q", out)
+	return string(out)
+}
+
+// TestLeftoverProbeIsASingleSimpleCommand pins the shape the probe has to have.
+// The executors prepend an assignment without a separator, so a compound command
+// makes the host fail with "syntax error near unexpected token `do'". This is
+// checked by the shell itself rather than by comparing strings.
+func TestLeftoverProbeIsASingleSimpleCommand(t *testing.T) {
+	require := require.New(t)
+
+	cmd := executorPrefix + leftoverTrimmedLogsCmdIn(t.TempDir())
+	require.NoError(exec.Command("sh", "-n", "-c", cmd).Run(),
+		"the probe must be valid in one command: %s", cmd)
+
+	// and the shape that is not: a loop sent as it is
+	compound := executorPrefix + `for d in /tmp/x*; do echo "$d"; done`
+	require.Error(exec.Command("sh", "-n", "-c", compound).Run(),
+		"a compound command can not follow the prefix, so the probe must not be one")
+}
+
 // TestLeftoverProbeReportsCandidatesWithoutTouchingThem runs the command the
 // hosts receive against a directory shaped the way the real one is: it has to
 // report the directories that could hold trimmed logs with their size, leave out
@@ -112,11 +144,10 @@ func TestLeftoverProbeReportsCandidatesWithoutTouchingThem(t *testing.T) {
 	other := filepath.Join(root, "other")
 	assert.NoError(os.MkdirAll(other, 0o700))
 
-	out, err := exec.Command("sh", "-c", leftoverTrimmedLogsCmdIn(root)).Output()
-	assert.NoError(err, "output: %q", out)
+	out := runLikeAnExecutor(t, leftoverTrimmedLogsCmdIn(root))
 
 	reported := map[string]int64{}
-	for _, l := range parseLeftoverTrimmedLogs(string(out)) {
+	for _, l := range parseLeftoverTrimmedLogs(out) {
 		reported[l.path] = l.size
 	}
 	assert.Len(reported, 2, "found %v in %q", reported, out)
@@ -147,9 +178,8 @@ func TestLeftoverProbeWithoutLeftoversIsSilentAndSuccessful(t *testing.T) {
 	assert := require.New(t)
 
 	for _, root := range []string{t.TempDir(), filepath.Join(t.TempDir(), "does-not-exist")} {
-		out, err := exec.Command("sh", "-c", leftoverTrimmedLogsCmdIn(root)).Output()
-		assert.NoError(err, "root %s, output: %q", root, out)
-		assert.Empty(parseLeftoverTrimmedLogs(string(out)), "root %s, output: %q", root, out)
+		out := runLikeAnExecutor(t, leftoverTrimmedLogsCmdIn(root))
+		assert.Empty(parseLeftoverTrimmedLogs(out), "root %s, output: %q", root, out)
 	}
 }
 
@@ -331,7 +361,7 @@ func TestLeftoverRemovalFollowsTheAnswer(t *testing.T) {
 			answer = tc.answer
 			opt := &LogCollectOptions{cleanLeftover: tc.clean, skipConfirm: tc.skip}
 
-			assert.Equal(tc.want, opt.confirmLeftoverTrimmedRemoval("desc"))
+			assert.Equal(tc.want, opt.confirmLeftoverTrimmedRemoval())
 			assert.Equal(tc.wantAsked, asked)
 		})
 	}
