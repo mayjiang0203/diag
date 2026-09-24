@@ -64,22 +64,20 @@ func TestCollectScrapedStats(t *testing.T) {
 // gone by the time the download starts and the rocksdb logs would silently miss
 // from the package.
 func TestTrimDirOutlivesOtherCollectors(t *testing.T) {
+	c := &LogCollectOptions{}
 	assert := require.New(t)
 
-	assert.NotEqual(task.CheckToolsPathDir, trimDir())
-	assert.False(isWithin(task.CheckToolsPathDir, trimDir()),
+	assert.NotEqual(task.CheckToolsPathDir, c.trimDir())
+	assert.False(isWithin(task.CheckToolsPathDir, c.trimDir()),
 		"the trim dir %q must not live inside %q, which other collectors remove before the log collector downloads its files",
-		trimDir(), task.CheckToolsPathDir)
+		c.trimDir(), task.CheckToolsPathDir)
 }
 
-// TestLogCollectorRemovesItsOwnTrimDir: whatever a collector creates on the
-// target host it also has to clean up, otherwise the copies leak.
-func TestLogCollectorRemovesItsOwnTrimDir(t *testing.T) {
-	assert := require.New(t)
-
-	cleaned := logCleanupDirs()
-	assert.Contains(cleaned, trimDir())
-	assert.Contains(cleaned, task.CheckToolsPathDir)
+func TestTrimDirIsUniqueAndStable(t *testing.T) {
+	first, second := &LogCollectOptions{}, &LogCollectOptions{}
+	dir := first.trimDir()
+	require.Equal(t, dir, first.trimDir())
+	require.NotEqual(t, dir, second.trimDir())
 }
 
 // TestPrepareCollectsNothingWithoutAType pins the early return of Prepare
@@ -216,28 +214,29 @@ func TestNeedsCollectMatchesTheSelectedTypes(t *testing.T) {
 }
 
 func TestPathInPackage(t *testing.T) {
+	c := &LogCollectOptions{}
 	assert := require.New(t)
 
 	// a trimmed rocksdb log keeps its place in the package instead of showing
 	// the temporary directory it was written to on the remote host
 	assert.Equal(
 		filepath.Join("/tmp/result", "127.0.0.1", "data/tikv-20160/rocksdb.info"),
-		pathInPackage("/tmp/result", "127.0.0.1",
-			filepath.Join(trimDir(), "data/tikv-20160/rocksdb.info")),
+		c.pathInPackage("/tmp/result", "127.0.0.1",
+			filepath.Join(c.trimDir(), "data/tikv-20160/rocksdb.info")),
 	)
 	// any other file keeps its absolute path, as before
 	assert.Equal(
 		filepath.Join("/tmp/result", "127.0.0.1", "/data/tikv-20160/log/tikv.log"),
-		pathInPackage("/tmp/result", "127.0.0.1", "/data/tikv-20160/log/tikv.log"),
+		c.pathInPackage("/tmp/result", "127.0.0.1", "/data/tikv-20160/log/tikv.log"),
 	)
 	// the trim directory itself and its parent are not treated as trimmed files
 	assert.Equal(
-		filepath.Join("/tmp/result", "127.0.0.1", trimDir()),
-		pathInPackage("/tmp/result", "127.0.0.1", trimDir()),
+		filepath.Join("/tmp/result", "127.0.0.1", c.trimDir()),
+		c.pathInPackage("/tmp/result", "127.0.0.1", c.trimDir()),
 	)
 	assert.Equal(
 		filepath.Join("/tmp/result", "127.0.0.1", "/tmp/tiup"),
-		pathInPackage("/tmp/result", "127.0.0.1", "/tmp/tiup"),
+		c.pathInPackage("/tmp/result", "127.0.0.1", "/tmp/tiup"),
 	)
 	// only the real trim dir is stripped: a file below the shared tools dir
 	// keeps its path, so a wrong trim location shows up in the package instead
@@ -245,7 +244,7 @@ func TestPathInPackage(t *testing.T) {
 	assert.Equal(
 		filepath.Join("/tmp/result", "127.0.0.1",
 			filepath.Join(task.CheckToolsPathDir, "trimmed", "rocksdb.info")),
-		pathInPackage("/tmp/result", "127.0.0.1",
+		c.pathInPackage("/tmp/result", "127.0.0.1",
 			filepath.Join(task.CheckToolsPathDir, "trimmed", "rocksdb.info")),
 	)
 }

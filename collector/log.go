@@ -19,8 +19,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 
+	"github.com/google/uuid"
 	"github.com/joomcode/errorx"
 	json "github.com/json-iterator/go"
 	"github.com/pingcap/diag/pkg/models"
@@ -33,6 +36,7 @@ import (
 	"github.com/pingcap/tiup/pkg/cluster/task"
 	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
 	"github.com/pingcap/tiup/pkg/set"
+	"github.com/pingcap/tiup/pkg/tui"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -42,36 +46,102 @@ const (
 	// componentDiagCollector is the component name of diagnostic collector
 	componentDiagCollector = "diag"
 
-	// trimDirName is the directory holding the time range trimmed copies of the
-	// rocksdb logs. It belongs to the log collector, which removes it once the
-	// files have been downloaded.
-	trimDirName = "diag-trimmed"
+	// trimDirPrefix is the first part of the name of every directory holding
+	// trimmed logs. Together with trimDirRoot it is the whole rule deciding
+	// what this collector is allowed to remove on a target host, so leftovers
+	// of an interrupted collection are matched by name and never by position.
+	trimDirPrefix = "diag-trimmed-"
 )
 
-// trimDir is where the scraper writes the time range trimmed rocksdb logs.
-//
-// The trimmed copies are created by Prepare and downloaded by Collect, so they
-// have to survive the Collect phase of the other collectors. task.CheckToolsPathDir
-// is removed by the system, TSDB and config collectors while they collect, and
-// those run before the log collector (they are registered first in
-// buildCollectors), which would leave nothing to download. Hence a directory of
-// our own next to it, never below it.
-func trimDir() string {
-	return filepath.Join(filepath.Dir(task.CheckToolsPathDir), trimDirName)
+// trimDirRoot is the directory holding the trimmed logs: private to this
+// collection and outside the shared tools directory, which other collectors can
+// remove before the log download starts.
+func trimDirRoot() string {
+	return filepath.Dir(task.CheckToolsPathDir)
 }
 
-// logCleanupDirs are the directories the log collector removes from the target
-// hosts once its files have been downloaded.
-func logCleanupDirs() []string {
-	return []string{task.CheckToolsPathDir, trimDir()}
+// trimDir is the directory this run trims into. The random suffix keeps the
+// copies of one run apart from the leftovers of another one, so a run never
+// removes what it did not create unless the user asks for it.
+func (c *LogCollectOptions) trimDir() string {
+	if c.trimPath == "" {
+		c.trimPath = filepath.Join(trimDirRoot(), trimDirPrefix+uuid.NewString())
+	}
+	return c.trimPath
+}
+
+// isTrimDirName reports whether name is a name trimDir() can produce. The
+// suffix is the uuid of the run that created the directory, which keeps a file
+// that merely starts with the prefix from being taken for a trimmed logs
+// directory.
+func isTrimDirName(name string) bool {
+	suffix, found := strings.CutPrefix(name, trimDirPrefix)
+	if !found {
+		return false
+	}
+	_, err := uuid.Parse(suffix)
+	return err == nil
+}
+
+// assertRemovableTrimDir refuses to remove anything but a directory the
+// trimming rule created: one level below trimDirRoot, named trimDirPrefix
+// followed by a uuid. Removing a path that does not match the rule means the
+// rule changed, and deleting it could destroy data this collector does not own.
+func assertRemovableTrimDir(dir string) error {
+	switch {
+	case dir == "" || !filepath.IsAbs(dir) || filepath.Clean(dir) != dir:
+		return fmt.Errorf("refusing to remove %q: not a clean absolute path", dir)
+	case filepath.Dir(dir) != trimDirRoot() || !isTrimDirName(filepath.Base(dir)):
+		return fmt.Errorf("refusing to remove %q: only %s*%s directories in %s are created by log trimming",
+			dir, trimDirPrefix, "<uuid>", trimDirRoot())
+	}
+	return nil
+}
+
+// prepareTrimDir registers cleanup only after this run creates the directory.
+// Keep the executor from Prepare so Close also works if Collect is never called.
+func (c *LogCollectOptions) prepareTrimDir(host string) *task.Func {
+	dir := c.trimDir()
+	return task.NewFunc("prepare private trim directory", func(ctx context.Context) error {
+		exec, ok := ctxt.GetInner(ctx).GetExecutor(host)
+		if !ok {
+			return task.ErrNoExecutor
+		}
+		if _, _, err := exec.Execute(ctx, "mkdir -m 700 -- '"+dir+"'", false); err != nil {
+			return err
+		}
+		c.trimMu.Lock()
+		defer c.trimMu.Unlock()
+		if c.trimCleanups == nil {
+			c.trimCleanups = make(map[string]func())
+		}
+		c.trimCleanups[host] = func() {
+			if _, _, err := exec.Execute(context.Background(), "rm -rf -- '"+dir+"'", false); err != nil {
+				ctx.Value(logprinter.ContextKeyLogger).(*logprinter.Logger).Warnf("Failed to clean trimmed logs on %s in %s: %v", host, dir, err)
+			}
+		}
+		return nil
+	})
+}
+
+// Close releases only the directories created by this collection. It is safe
+// to call after Collect and again when the manager returns (including aborts).
+func (c *LogCollectOptions) Close() {
+	c.trimMu.Lock()
+	cleanups := c.trimCleanups
+	c.trimCleanups = nil
+	c.trimMu.Unlock()
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
 }
 
 // pathInPackage returns the path a collected file gets inside the package. A
 // trimmed copy is reported by the scraper with its absolute temporary path,
 // which must not leak into the package: it is placed where the original file
 // would have been.
-func pathInPackage(resultDir, host, target string) string {
-	rel, err := filepath.Rel(trimDir(), target)
+func (c *LogCollectOptions) pathInPackage(resultDir, host, target string) string {
+	rel, err := filepath.Rel(c.trimDir(), target)
 	if err == nil && rel != "." && rel != ".." &&
 		!strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return filepath.Join(resultDir, host, rel)
@@ -90,13 +160,18 @@ type collectLog struct {
 // LogCollectOptions are options used collecting component logs
 type LogCollectOptions struct {
 	*BaseOptions
-	collector collectLog
-	opt       *operator.Options // global operations from cli
-	limit     int               // scp rate limit
-	resultDir string
-	fileStats map[string][]CollectStat
-	compress  bool
-	kubeCli   *kubernetes.Clientset
+	collector     collectLog
+	opt           *operator.Options // global operations from cli
+	limit         int               // scp rate limit
+	resultDir     string
+	fileStats     map[string][]CollectStat
+	compress      bool
+	kubeCli       *kubernetes.Clientset
+	skipConfirm   bool // assume yes to every confirmation, as -y does
+	cleanLeftover bool // remove leftover trimmed logs without asking
+	trimPath      string
+	trimMu        sync.Mutex
+	trimCleanups  map[string]func()
 }
 
 // Desc implements the Collector interface
@@ -150,9 +225,282 @@ func (c *LogCollectOptions) needsCollect() bool {
 	return len(c.logTypesToScrap()) > 0 || c.collector.Rocksdb
 }
 
+// leftoverTrimmedLog is one directory of trimmed logs an earlier collection
+// left on a host, with the disk it still occupies.
+type leftoverTrimmedLog struct {
+	path string
+	size int64
+}
+
+// leftoverTrimmedLogsCmdIn prints one "<path>\t<size in KiB>" line per
+// directory that could hold trimmed logs below root. It matches by name - the
+// name trimming gives its directories - and touches nothing: whether a matched
+// entry really belongs to this collector is decided by assertRemovableTrimDir,
+// in one place, before anything is removed. du -sk is POSIX, -b would need GNU.
+func leftoverTrimmedLogsCmdIn(root string) string {
+	return fmt.Sprintf(
+		`for d in '%s'/%s*; do if [ -d "$d" ]; then printf '%%s\t%%s\n' "$d" "$(du -sk "$d" 2>/dev/null | cut -f1)"; fi; done`,
+		root, trimDirPrefix)
+}
+
+// leftoverTrimmedLogsCmd looks for trimmed logs where this run would put them.
+func leftoverTrimmedLogsCmd() string {
+	return leftoverTrimmedLogsCmdIn(trimDirRoot())
+}
+
+// parseLeftoverTrimmedLogs reads the output of leftoverTrimmedLogsCmd and turns
+// the reported kibibytes into bytes. A line it can not make sense of is ignored,
+// and an unreadable size counts as 0: a host that fails to report leftovers then
+// looks like a host without any, which only means the user is not offered to
+// remove them.
+func parseLeftoverTrimmedLogs(out string) []leftoverTrimmedLog {
+	var logs []leftoverTrimmedLog
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r\n")
+		path, size, found := strings.Cut(line, "\t")
+		if !found {
+			continue
+		}
+		if path = strings.TrimSpace(path); path == "" {
+			continue
+		}
+		kib, err := strconv.ParseInt(strings.TrimSpace(size), 10, 64)
+		if err != nil || kib < 0 {
+			kib = 0
+		}
+		logs = append(logs, leftoverTrimmedLog{path: path, size: kib * 1024})
+	}
+	return logs
+}
+
+// probeLeftoverTrimmedLogs looks for the trimmed logs an interrupted collection
+// left on hosts, so that the user can be asked about them before this run adds
+// its own.
+func (c *LogCollectOptions) probeLeftoverTrimmedLogs(ctx context.Context, m *Manager, topo spec.Topology, hosts []string) (map[string][]leftoverTrimmedLog, error) {
+	steps := make([]*task.StepDisplay, 0, len(hosts))
+	for _, host := range hosts {
+		b, err := m.sshTaskBuilder(c.GetBaseOptions().Cluster, topo, c.GetBaseOptions().User, *c.opt)
+		if err != nil {
+			return nil, err
+		}
+		steps = append(steps, b.
+			Shell(host, leftoverTrimmedLogsCmd(), "", false).
+			BuildAsStep(fmt.Sprintf("  - Looking for leftover trimmed logs on %s", host)))
+	}
+	if len(steps) == 0 {
+		return nil, nil
+	}
+
+	t := task.NewBuilder(m.logger).
+		ParallelStep("+ Looking for leftover trimmed logs", false, steps...).
+		Build()
+	if err := t.Execute(ctx); err != nil {
+		return nil, perrs.Trace(err)
+	}
+
+	leftovers := make(map[string][]leftoverTrimmedLog)
+	for _, host := range hosts {
+		stdout, _, _ := ctxt.GetInner(ctx).GetOutputs(host)
+		if logs := parseLeftoverTrimmedLogs(string(stdout)); len(logs) > 0 {
+			leftovers[host] = logs
+		}
+	}
+	return leftovers, nil
+}
+
+// ownedTrimmedLogs keeps the entries the removal rule accepts - the directories
+// this version of the trimming created - and returns the others apart, so an
+// entry that only looks like one is reported instead of being removed.
+func ownedTrimmedLogs(logs []leftoverTrimmedLog) (owned, foreign []leftoverTrimmedLog) {
+	for _, l := range logs {
+		if err := assertRemovableTrimDir(l.path); err != nil {
+			foreign = append(foreign, l)
+			continue
+		}
+		owned = append(owned, l)
+	}
+	return owned, foreign
+}
+
+// describeLeftoverTrimmedLogs sums up what was found, one line per host.
+func describeLeftoverTrimmedLogs(hosts []string, leftovers map[string][]leftoverTrimmedLog) (string, int64) {
+	var total int64
+	var b strings.Builder
+	for _, host := range hosts {
+		logs, found := leftovers[host]
+		if !found {
+			continue
+		}
+		var size int64
+		parts := make([]string, 0, len(logs))
+		for _, l := range logs {
+			size += l.size
+			parts = append(parts, fmt.Sprintf("%s (%s)", l.path, readableSize(l.size)))
+		}
+		total += size
+		fmt.Fprintf(&b, "  %s: %s\n", host, strings.Join(parts, ", "))
+	}
+	return b.String(), total
+}
+
+// confirmLeftoverTrimmedRemoval asks whether the leftovers may be removed. -y
+// answers yes to every confirmation, so it does not ask; neither does the flag
+// that asks for the removal explicitly.
+func (c *LogCollectOptions) confirmLeftoverTrimmedRemoval(desc string) bool {
+	if c.cleanLeftover || c.skipConfirm {
+		return true
+	}
+	ok, _ := confirmRemoveLeftover(strings.TrimRight(desc, "\n") + "\nRemove them before collecting?")
+	return ok
+}
+
+// confirmRemoveLeftover is the prompt used to decide about the leftovers, kept
+// in a variable so that both answers can be exercised.
+var confirmRemoveLeftover = tui.PromptForConfirmYes
+
+// buildLeftoverRemovalSteps builds one step per host holding leftovers, removing
+// exactly the directories given and nothing else: every path is checked against
+// the trimming rule first, and a path that fails the check aborts the whole
+// removal rather than removing something this collector does not own.
+func (c *LogCollectOptions) buildLeftoverRemovalSteps(m *Manager, topo spec.Topology, hosts []string, leftovers map[string][]leftoverTrimmedLog) ([]*task.StepDisplay, error) {
+	steps := make([]*task.StepDisplay, 0, len(hosts))
+	for _, host := range hosts {
+		logs, found := leftovers[host]
+		if !found {
+			continue
+		}
+		for _, l := range logs {
+			if err := assertRemovableTrimDir(l.path); err != nil {
+				return nil, err
+			}
+		}
+
+		b, err := m.sshTaskBuilder(c.GetBaseOptions().Cluster, topo, c.GetBaseOptions().User, *c.opt)
+		if err != nil {
+			return nil, err
+		}
+		for _, l := range logs {
+			m.logger.Infof("Removing leftover trimmed logs on %s: %s (%s)", host, l.path, readableSize(l.size))
+			b = b.Rmdir(host, l.path)
+		}
+		steps = append(steps, b.BuildAsStep(fmt.Sprintf("  - Removing leftover trimmed logs on %s", host)))
+	}
+	return steps, nil
+}
+
+// removeLeftoverTrimmedLogs removes the leftover directories of hosts.
+func (c *LogCollectOptions) removeLeftoverTrimmedLogs(ctx context.Context, m *Manager, topo spec.Topology, hosts []string, leftovers map[string][]leftoverTrimmedLog) error {
+	steps, err := c.buildLeftoverRemovalSteps(m, topo, hosts, leftovers)
+	if err != nil {
+		return err
+	}
+	if len(steps) == 0 {
+		return nil
+	}
+
+	t := task.NewBuilder(m.logger).
+		ParallelStep("+ Removing leftover trimmed logs", false, steps...).
+		Build()
+	if err := t.Execute(ctx); err != nil {
+		return perrs.Trace(err)
+	}
+	return nil
+}
+
+// cleanLeftoverTrimmedLogs removes the trimmed logs a previous collection left
+// on the hosts. A collection interrupted before it downloaded its files leaves
+// them behind, and nothing else would ever clean them up, so they are reported
+// and - unless the run may not ask - the user decides.
+func (c *LogCollectOptions) cleanLeftoverTrimmedLogs(ctx context.Context, m *Manager, topo spec.Topology) error {
+	hosts := c.logHosts(topo)
+	if len(hosts) == 0 {
+		return nil
+	}
+
+	leftovers, err := c.probeLeftoverTrimmedLogs(ctx, m, topo, hosts)
+	if err != nil {
+		return err
+	}
+
+	// Only the directories the trimming rule names are this collector's to
+	// remove. Anything else the probe matched - a directory of an older or a
+	// newer naming, a file starting like one - is left alone and reported, so
+	// that a change of the rule can not turn into removing foreign data.
+	owned := make(map[string][]leftoverTrimmedLog)
+	for host, logs := range leftovers {
+		ours, foreign := ownedTrimmedLogs(logs)
+		if len(foreign) > 0 {
+			paths := make([]string, 0, len(foreign))
+			for _, l := range foreign {
+				paths = append(paths, l.path)
+			}
+			m.logger.Warnf("Not touching %s on %s: log trimming did not create it, remove it by hand if it is not needed",
+				strings.Join(paths, ", "), host)
+		}
+		if len(ours) > 0 {
+			owned[host] = ours
+		}
+	}
+	if len(owned) == 0 {
+		return nil
+	}
+
+	desc, total := describeLeftoverTrimmedLogs(hosts, owned)
+	header := fmt.Sprintf("Found %s of trimmed logs from an interrupted collection in %s:", readableSize(total), trimDirRoot())
+	if !c.confirmLeftoverTrimmedRemoval(header + "\n" + desc) {
+		m.logger.Warnf("%s\n%s\nKeeping them: they are not part of this collection and a later one will ask again",
+			header, desc)
+		return nil
+	}
+	if err := c.removeLeftoverTrimmedLogs(ctx, m, topo, hosts, owned); err != nil {
+		return err
+	}
+	m.logger.Infof("%s\n%s\nRemoved them", header, desc)
+	return nil
+}
+
 // scraperPath is where the scraper binary is found on the target hosts.
 func scraperPath() string {
 	return filepath.Join(task.CheckToolsPathDir, "bin", "scraper")
+}
+
+// consideredInstances returns the instances this collector works on, in start
+// order: the components carrying logs, filtered by the --role and --node
+// options. Both building the collection steps and looking for leftovers of an
+// earlier collection go through it, so they can not disagree on which hosts
+// hold data of this collector.
+func (c *LogCollectOptions) consideredInstances(topo spec.Topology) []spec.Instance {
+	roleFilter := set.NewStringSet(c.opt.Roles...)
+	nodeFilter := set.NewStringSet(c.opt.Nodes...)
+	components := operator.FilterComponent(topo.ComponentsByStartOrder(), roleFilter)
+
+	var instances []spec.Instance
+	for _, comp := range components {
+		switch comp.Name() {
+		case spec.ComponentGrafana,
+			spec.ComponentAlertmanager,
+			spec.ComponentTiSpark,
+			spec.ComponentSpark:
+			continue
+		}
+		instances = append(instances, operator.FilterInstance(comp.Instances(), nodeFilter)...)
+	}
+	return instances
+}
+
+// logHosts returns the hosts consideredInstances live on, without repetition,
+// in the order they are met.
+func (c *LogCollectOptions) logHosts(topo spec.Topology) []string {
+	var hosts []string
+	seen := map[string]struct{}{}
+	for _, inst := range c.consideredInstances(topo) {
+		if _, found := seen[inst.GetHost()]; found {
+			continue
+		}
+		seen[inst.GetHost()] = struct{}{}
+		hosts = append(hosts, inst.GetHost())
+	}
+	return hosts
 }
 
 // genericScraperCmd builds the command scraping the component log directories.
@@ -206,7 +554,24 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 		return nil, nil
 	}
 
-	tasks, err := c.buildTiUPLogTasks(m, cls.Attributes[CollectModeTiUP].(spec.Topology))
+	topo := cls.Attributes[CollectModeTiUP].(spec.Topology)
+	ctx := ctxt.New(
+		context.Background(),
+		c.opt.Concurrency,
+		m.logger,
+	)
+
+	// Trimming leaves its copies behind if a collection dies before it
+	// downloads them, and only trimming knows where they are: ask about them
+	// before this run adds more.
+	if c.collector.Rocksdb {
+		if err := c.cleanLeftoverTrimmedLogs(ctx, m, topo); err != nil {
+			// the manager closes every collector even when Prepare fails
+			return nil, perrs.Trace(err)
+		}
+	}
+
+	tasks, err := c.buildTiUPLogTasks(m, topo)
 	if err != nil {
 		return nil, err
 	}
@@ -216,12 +581,8 @@ func (c *LogCollectOptions) Prepare(m *Manager, cls *models.TiDBCluster) (map[st
 		ParallelStep("+ Collect host information", false, tasks.scrape...).
 		Build()
 
-	ctx := ctxt.New(
-		context.Background(),
-		c.opt.Concurrency,
-		m.logger,
-	)
 	if err := t.Execute(ctx); err != nil {
+		c.Close()
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
 			return nil, err
@@ -254,91 +615,77 @@ func (c *LogCollectOptions) buildTiUPLogTasks(m *Manager, topo spec.Topology) (*
 	uniqueArchList := make(map[string]struct{}) // map["os-arch"]{}
 	hostPaths := make(map[string]set.StringSet)
 	hostTasks := make(map[string]*task.Builder)
+	trimHosts := make(map[string]bool)
 
-	roleFilter := set.NewStringSet(c.opt.Roles...)
-	nodeFilter := set.NewStringSet(c.opt.Nodes...)
-	components := topo.ComponentsByStartOrder()
-	components = operator.FilterComponent(components, roleFilter)
-
-	for _, comp := range components {
-		switch comp.Name() {
-		case spec.ComponentGrafana,
-			spec.ComponentAlertmanager,
-			spec.ComponentTiSpark,
-			spec.ComponentSpark:
-			continue
-		}
-		instances := operator.FilterInstance(comp.Instances(), nodeFilter)
-		if len(instances) < 1 {
-			continue
+	for _, inst := range c.consideredInstances(topo) {
+		archKey := fmt.Sprintf("%s-%s", inst.OS(), inst.Arch())
+		if _, found := uniqueArchList[archKey]; !found {
+			uniqueArchList[archKey] = struct{}{}
+			t0 := task.NewBuilder(m.logger).
+				Download(
+					componentDiagCollector,
+					inst.OS(),
+					inst.Arch(),
+					diagcolVer,
+				).
+				BuildAsStep(fmt.Sprintf("  - Downloading collecting tools for %s/%s", inst.OS(), inst.Arch()))
+			downloadTasks = append(downloadTasks, t0)
 		}
 
-		for _, inst := range instances {
-			archKey := fmt.Sprintf("%s-%s", inst.OS(), inst.Arch())
-			if _, found := uniqueArchList[archKey]; !found {
-				uniqueArchList[archKey] = struct{}{}
-				t0 := task.NewBuilder(m.logger).
-					Download(
-						componentDiagCollector,
-						inst.OS(),
-						inst.Arch(),
-						diagcolVer,
-					).
-					BuildAsStep(fmt.Sprintf("  - Downloading collecting tools for %s/%s", inst.OS(), inst.Arch()))
-				downloadTasks = append(downloadTasks, t0)
+		// tasks that applies to each host
+		if _, found := uniqueHosts[inst.GetHost()]; !found {
+			uniqueHosts[inst.GetHost()] = inst.GetSSHPort()
+			// build system info collecting tasks
+			t1, err := m.sshTaskBuilder(c.GetBaseOptions().Cluster, topo, c.GetBaseOptions().User, *c.opt)
+			if err != nil {
+				return nil, err
 			}
-
-			// tasks that applies to each host
-			if _, found := uniqueHosts[inst.GetHost()]; !found {
-				uniqueHosts[inst.GetHost()] = inst.GetSSHPort()
-				// build system info collecting tasks
-				t1, err := m.sshTaskBuilder(c.GetBaseOptions().Cluster, topo, c.GetBaseOptions().User, *c.opt)
-				if err != nil {
-					return nil, err
-				}
-				t1 = t1.
-					Mkdir(c.GetBaseOptions().User, inst.GetHost(), filepath.Join(task.CheckToolsPathDir, "bin")).
-					CopyComponent(
-						componentDiagCollector,
-						inst.OS(),
-						inst.Arch(),
-						diagcolVer,
-						"", // use default srcPath
-						inst.GetHost(),
-						task.CheckToolsPathDir,
-					)
-				hostTasks[inst.GetHost()] = t1
-			}
-
-			// Placing this code here is not elegant, but it can avoid encountering unknown files from collecting datadir.
-			if c.collector.Rocksdb && inst.ComponentName() == spec.ComponentTiKV {
-				// --trim keeps only the rocksdb lines inside the requested time
-				// range. A data directory accumulates one rocksdb.info per
-				// rotation and TiKV never deletes the rotated ones
-				// (log.file.max-backups defaults to 0), so collecting them in
-				// full is both slow and useless.
-				host := inst.GetHost()
-				hostTasks[host].
-					Shell(
-						host,
-						rocksdbScraperCmd(inst.DataDir(), c.ScrapeBegin, c.ScrapeEnd, trimDir()),
-						"",
-						false,
-					).
-					Func(
-						host,
-						func(ctx context.Context) error {
-							return c.collectScrapedStats(ctx, host)
-						},
-					)
-			}
-
-			// add filepaths to list
-			if _, found := hostPaths[inst.GetHost()]; !found {
-				hostPaths[inst.GetHost()] = set.NewStringSet()
-			}
-			hostPaths[inst.GetHost()].Insert(fmt.Sprintf("%s/*", inst.LogDir()))
+			t1 = t1.
+				Mkdir(c.GetBaseOptions().User, inst.GetHost(), filepath.Join(task.CheckToolsPathDir, "bin")).
+				CopyComponent(
+					componentDiagCollector,
+					inst.OS(),
+					inst.Arch(),
+					diagcolVer,
+					"", // use default srcPath
+					inst.GetHost(),
+					task.CheckToolsPathDir,
+				)
+			hostTasks[inst.GetHost()] = t1
 		}
+
+		// Placing this code here is not elegant, but it can avoid encountering unknown files from collecting datadir.
+		if c.collector.Rocksdb && inst.ComponentName() == spec.ComponentTiKV {
+			// --trim keeps only the rocksdb lines inside the requested time
+			// range. A data directory accumulates one rocksdb.info per
+			// rotation and TiKV never deletes the rotated ones
+			// (log.file.max-backups defaults to 0), so collecting them in
+			// full is both slow and useless.
+			host := inst.GetHost()
+			if !trimHosts[host] {
+				trimHosts[host] = true
+				hostTasks[host].Func(host, c.prepareTrimDir(host).Execute)
+			}
+			hostTasks[host].
+				Shell(
+					host,
+					rocksdbScraperCmd(inst.DataDir(), c.ScrapeBegin, c.ScrapeEnd, c.trimDir()),
+					"",
+					false,
+				).
+				Func(
+					host,
+					func(ctx context.Context) error {
+						return c.collectScrapedStats(ctx, host)
+					},
+				)
+		}
+
+		// add filepaths to list
+		if _, found := hostPaths[inst.GetHost()]; !found {
+			hostPaths[inst.GetHost()] = set.NewStringSet()
+		}
+		hostPaths[inst.GetHost()].Insert(fmt.Sprintf("%s/*", inst.LogDir()))
 	}
 
 	scraperLogType := c.logTypesToScrap()
@@ -375,6 +722,7 @@ func (c *LogCollectOptions) buildTiUPLogTasks(m *Manager, topo spec.Topology) (*
 
 // Collect implements the Collector interface
 func (c *LogCollectOptions) Collect(m *Manager, cls *models.TiDBCluster) error {
+	defer c.Close()
 	switch m.mode {
 	case CollectModeTiUP:
 	case CollectModeK8s:
@@ -399,7 +747,7 @@ func (c *LogCollectOptions) Collect(m *Manager, cls *models.TiDBCluster) error {
 		c.opt.Concurrency,
 		m.logger,
 	)
-	if err := t.Execute(ctx); err != nil {
+	if err := c.runLogDownload(ctx, t); err != nil {
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
 			return err
@@ -410,70 +758,57 @@ func (c *LogCollectOptions) Collect(m *Manager, cls *models.TiDBCluster) error {
 	return nil
 }
 
+// runLogDownload keeps cleanup independent of the serial task's success path.
+func (c *LogCollectOptions) runLogDownload(ctx context.Context, t task.Task) error {
+	defer c.Close()
+	return t.Execute(ctx)
+}
+
 // buildTiUPLogDownloadTasks builds the steps that download the files found on
 // the hosts and the ones that remove the temporary directories afterwards,
 // without running them.
 func (c *LogCollectOptions) buildTiUPLogDownloadTasks(m *Manager, topo spec.Topology) (collectTasks, cleanTasks []*task.StepDisplay, err error) {
 	uniqueHosts := map[string]int{} // host -> ssh-port
 
-	roleFilter := set.NewStringSet(c.opt.Roles...)
-	nodeFilter := set.NewStringSet(c.opt.Nodes...)
-	components := topo.ComponentsByStartOrder()
-	components = operator.FilterComponent(components, roleFilter)
-
-	for _, comp := range components {
-		switch comp.Name() {
-		case spec.ComponentGrafana,
-			spec.ComponentAlertmanager,
-			spec.ComponentTiSpark,
-			spec.ComponentSpark:
+	for _, inst := range c.consideredInstances(topo) {
+		// checks that applies to each host
+		if _, found := uniqueHosts[inst.GetHost()]; found {
 			continue
 		}
-		instances := operator.FilterInstance(comp.Instances(), nodeFilter)
-		if len(instances) < 1 {
-			continue
+		uniqueHosts[inst.GetHost()] = inst.GetSSHPort()
+
+		t2, err := m.sshTaskBuilder(c.GetBaseOptions().Cluster, topo, c.GetBaseOptions().User, *c.opt)
+		if err != nil {
+			return nil, nil, err
 		}
-
-		for _, inst := range instances {
-			// checks that applies to each host
-			if _, found := uniqueHosts[inst.GetHost()]; found {
-				continue
-			}
-			uniqueHosts[inst.GetHost()] = inst.GetSSHPort()
-
-			t2, err := m.sshTaskBuilder(c.GetBaseOptions().Cluster, topo, c.GetBaseOptions().User, *c.opt)
-			if err != nil {
-				return nil, nil, err
-			}
-			for _, f := range c.fileStats[inst.GetHost()] {
-				// build checking tasks
-				t2 = t2.
-					// check for listening ports
-					CopyFile(
-						f.Target,
-						pathInPackage(c.resultDir, inst.GetHost(), f.Target),
-						inst.GetHost(),
-						true,
-						c.limit,
-						c.compress,
-					)
-			}
-			collectTasks = append(
-				collectTasks,
-				t2.BuildAsStep(fmt.Sprintf("  - Downloading log files from node %s", inst.GetHost())),
-			)
-
-			b, err := m.sshTaskBuilder(c.GetBaseOptions().Cluster, topo, c.GetBaseOptions().User, *c.opt)
-			if err != nil {
-				return nil, nil, err
-			}
-			// remove both the collecting tools and the trimmed copies this
-			// collector wrote during Prepare
-			t3 := b.
-				Rmdir(inst.GetHost(), logCleanupDirs()...).
-				BuildAsStep(fmt.Sprintf("  - Cleanup temp files on %s:%d", inst.GetHost(), inst.GetSSHPort()))
-			cleanTasks = append(cleanTasks, t3)
+		for _, f := range c.fileStats[inst.GetHost()] {
+			// build checking tasks
+			t2 = t2.
+				// check for listening ports
+				CopyFile(
+					f.Target,
+					c.pathInPackage(c.resultDir, inst.GetHost(), f.Target),
+					inst.GetHost(),
+					true,
+					c.limit,
+					c.compress,
+				)
 		}
+		collectTasks = append(
+			collectTasks,
+			t2.BuildAsStep(fmt.Sprintf("  - Downloading log files from node %s", inst.GetHost())),
+		)
+
+		b, err := m.sshTaskBuilder(c.GetBaseOptions().Cluster, topo, c.GetBaseOptions().User, *c.opt)
+		if err != nil {
+			return nil, nil, err
+		}
+		// Trimmed copies are removed by Close, even if downloading fails.
+		// Preserve the existing successful-run cleanup of collecting tools.
+		t3 := b.
+			Rmdir(inst.GetHost(), task.CheckToolsPathDir).
+			BuildAsStep(fmt.Sprintf("  - Cleanup temp files on %s:%d", inst.GetHost(), inst.GetSSHPort()))
+		cleanTasks = append(cleanTasks, t3)
 	}
 
 	return collectTasks, cleanTasks, nil

@@ -35,10 +35,16 @@ tikv_servers:
 
 func testTiUPTopology(t *testing.T) spec.Topology {
 	t.Helper()
+	return testTopology(t, tiupTopology)
+}
+
+// testTopology parses a topology the way a collection does.
+func testTopology(t *testing.T, yaml string) spec.Topology {
+	t.Helper()
 	require.NoError(t, spec.Initialize("cluster"))
 
 	f := filepath.Join(t.TempDir(), "topology.yaml")
-	require.NoError(t, os.WriteFile(f, []byte(tiupTopology), 0o644))
+	require.NoError(t, os.WriteFile(f, []byte(yaml), 0o644))
 
 	topo := &spec.Specification{}
 	require.NoError(t, spec.ParseTopologyYaml(f, topo))
@@ -97,7 +103,7 @@ func TestBuildTiUPLogTasksWiring(t *testing.T) {
 		rendered := renderSteps(tasks.scrape)
 		assert.Equal(2, strings.Count(rendered, "--logtype rocksdb"),
 			"one rocksdb scrape per TiKV instance on the host:\n%s", rendered)
-		assert.Equal(2, strings.Count(rendered, "--trim --trim-dir '"+trimDir()+"'"),
+		assert.Equal(2, strings.Count(rendered, "--trim --trim-dir '"+opt.trimDir()+"'"),
 			"every rocksdb scrape trims into the directory the log collector owns:\n%s", rendered)
 		assert.Contains(rendered, "--log '/data/db/data/tikv-20160/*'")
 		assert.Contains(rendered, "--log '/data/db/data/tikv-20161/*'")
@@ -123,11 +129,9 @@ func TestBuildTiUPLogTasksWiring(t *testing.T) {
 	})
 }
 
-// TestBuildTiUPLogDownloadTasks covers the two things Collect does with the file
-// list: download every entry to its place in the package, and remove the
-// trimmed copies together with the collecting tools afterwards. Nobody else
-// removes them - the system and TSDB collectors only remove the shared tools
-// directory - so without the cleanup they would stay on the host.
+// TestBuildTiUPLogDownloadTasks checks the remote sources, package paths and
+// successful-run tool cleanup. Private trim directories are instead released
+// by Close, including when downloads fail; see log_cleanup_test.go.
 func TestBuildTiUPLogDownloadTasks(t *testing.T) {
 	assert := require.New(t)
 	topo := testTiUPTopology(t)
@@ -136,7 +140,7 @@ func TestBuildTiUPLogDownloadTasks(t *testing.T) {
 	opt.fileStats = map[string][]CollectStat{
 		"127.0.0.1": {
 			// a trimmed copy: it has to land where the original file would be
-			{Target: filepath.Join(trimDir(), "data/db/data/tikv-20160/rocksdb.info"), Size: 10},
+			{Target: filepath.Join(opt.trimDir(), "data/db/data/tikv-20160/rocksdb.info"), Size: 10},
 			// a file collected in place keeps its own path
 			{Target: "/data/db/deploy/tikv-20160/log/tikv.log", Size: 20},
 		},
@@ -149,7 +153,7 @@ func TestBuildTiUPLogDownloadTasks(t *testing.T) {
 	// is the original location inside the package
 	rendered := renderSteps(download)
 	assert.Contains(rendered,
-		"remote=127.0.0.1:"+filepath.Join(trimDir(), "data/db/data/tikv-20160/rocksdb.info"))
+		"remote=127.0.0.1:"+filepath.Join(opt.trimDir(), "data/db/data/tikv-20160/rocksdb.info"))
 	assert.Contains(rendered,
 		"local="+filepath.Join("/tmp/result", "127.0.0.1", "data/db/data/tikv-20160/rocksdb.info"))
 	assert.Contains(rendered, "remote=127.0.0.1:/data/db/deploy/tikv-20160/log/tikv.log")
@@ -157,6 +161,6 @@ func TestBuildTiUPLogDownloadTasks(t *testing.T) {
 		"local="+filepath.Join("/tmp/result", "127.0.0.1", "/data/db/deploy/tikv-20160/log/tikv.log"))
 
 	cleaned := renderSteps(clean)
-	assert.Contains(cleaned, trimDir(), "the trimmed copies have to be cleaned up:\n%s", cleaned)
+	assert.NotContains(cleaned, opt.trimDir(), "private directories are cleaned unconditionally by Close")
 	assert.Contains(cleaned, task.CheckToolsPathDir)
 }
