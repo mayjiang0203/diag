@@ -357,7 +357,7 @@ func (c *LogCollectOptions) confirmLeftoverTrimmedRemoval() bool {
 	if c.cleanLeftover || c.skipConfirm {
 		return true
 	}
-	ok, _ := confirmRemoveLeftover("Remove the leftover trimmed logs before collecting?")
+	ok, _ := confirmRemoveLeftover("Remove these candidate trimmed logs before collecting?")
 	return ok
 }
 
@@ -414,10 +414,13 @@ func (c *LogCollectOptions) removeLeftoverTrimmedLogs(ctx context.Context, m *Ma
 	return nil
 }
 
-// cleanLeftoverTrimmedLogs removes the trimmed logs a previous collection left
-// on the hosts. A collection interrupted before it downloaded its files leaves
-// them behind, and nothing else would ever clean them up, so they are reported
-// and - unless the run may not ask - the user decides.
+// cleanLeftoverTrimmedLogs removes trimmed logs that may have been left by an
+// interrupted collection. A UUID identifies a directory but does not prove its
+// collection has stopped: a concurrent collection may still be using it.
+// TODO: Coordinate active collections (for example, with a lease) before
+// reclaiming directories, so an active collection cannot lose its files.
+// For now, reclaiming leftovers takes priority. A warning is always emitted;
+// -y and --clean-leftover-trimmed-logs skip the confirmation prompt.
 func (c *LogCollectOptions) cleanLeftoverTrimmedLogs(ctx context.Context, m *Manager, topo spec.Topology) error {
 	hosts := c.logHosts(topo)
 	if len(hosts) == 0 {
@@ -453,8 +456,9 @@ func (c *LogCollectOptions) cleanLeftoverTrimmedLogs(ctx context.Context, m *Man
 	}
 
 	desc, total := describeLeftoverTrimmedLogs(hosts, owned)
-	m.logger.Warnf("Found %s of trimmed logs from an interrupted collection in %s:\n%s",
+	m.logger.Warnf("Found %s of trimmed logs in %s (some may belong to an active concurrent collection):\n%s",
 		readableSize(total), trimDirRoot(), strings.TrimRight(desc, "\n"))
+	m.logger.Warnf("Removing these directories may interrupt a concurrent RocksDB log collection")
 
 	if !c.confirmLeftoverTrimmedRemoval() {
 		m.logger.Warnf("Keeping them: they are not part of this collection, and a later one will ask again")
@@ -463,7 +467,7 @@ func (c *LogCollectOptions) cleanLeftoverTrimmedLogs(ctx context.Context, m *Man
 	if err := c.removeLeftoverTrimmedLogs(ctx, m, topo, hosts, owned); err != nil {
 		return err
 	}
-	m.logger.Infof("Removed the leftover trimmed logs of the previous collection")
+	m.logger.Infof("Removed candidate trimmed logs")
 	return nil
 }
 
